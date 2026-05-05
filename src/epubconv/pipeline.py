@@ -8,6 +8,7 @@ from loguru import logger
 
 from .converters.content import convert_xhtml
 from .converters.opf import update_opf
+from .converters.writing_mode import apply_writing_mode
 from .engines.base import Engine
 from .epub import extract_epub, pack_epub
 
@@ -28,6 +29,7 @@ def convert_epub(
     dst: Path,
     engine: Engine,
     target_lang: str,
+    writing_mode: str = "preserve",
 ) -> Path:
     """Convert an EPUB end-to-end. Returns the output path."""
     with tempfile.TemporaryDirectory(prefix="epubconv-") as tmp:
@@ -44,6 +46,10 @@ def convert_epub(
 
         logger.info(f"opf: {pkg.opf_path.relative_to(work)}")
         update_opf(pkg.opf_path, engine, target_lang)
+
+        if writing_mode != "preserve":
+            logger.info(f"writing-mode: {writing_mode}")
+            apply_writing_mode(pkg, writing_mode)
 
         logger.info(f"pack: -> {dst}")
         dst.parent.mkdir(parents=True, exist_ok=True)
