@@ -6,7 +6,9 @@ from pathlib import Path
 import typer
 from loguru import logger
 
+from .engines.glossary_engine import GlossaryEngine
 from .engines.opencc_engine import OPENCC_CONFIGS, OpenCCEngine
+from .glossary import Glossary
 from .pipeline import convert_epub
 
 app = typer.Typer(
@@ -24,6 +26,15 @@ def convert(
     target_lang: str = typer.Option("zh-TW", "--to", "-t", help="Target language"),
     engine_name: str = typer.Option("opencc", "--engine", "-e", help="Conversion engine"),
     opencc_config: str = typer.Option(None, "--opencc-config", help="Override OpenCC config (e.g. s2twp)"),
+    glossary_path: Path = typer.Option(
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="YAML glossary with protect/pre/post rules",
+    ),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     """Convert an EPUB between Chinese variants."""
@@ -37,6 +48,15 @@ def convert(
         engine = OpenCCEngine(source_lang, target_lang, config=opencc_config)
     else:
         raise typer.BadParameter(f"unknown engine: {engine_name}")
+
+    if glossary_path is not None:
+        glossary = Glossary.from_yaml(glossary_path)
+        if not glossary.is_empty():
+            logger.info(
+                f"glossary: {glossary_path.name} "
+                f"(protect={len(glossary.protect)}, pre={len(glossary.pre)}, post={len(glossary.post)})"
+            )
+            engine = GlossaryEngine(engine, glossary)
 
     out = convert_epub(src, dst, engine, target_lang)
     typer.echo(str(out))
