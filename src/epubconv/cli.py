@@ -8,6 +8,8 @@ from loguru import logger
 
 from .engines.glossary_engine import GlossaryEngine
 from .engines.opencc_engine import OPENCC_CONFIGS, OpenCCEngine
+from .engines.punctuation_engine import PunctuationEngine
+from .converters.punctuation import punctuation_map_for
 from .glossary import Glossary
 from .pipeline import convert_epub
 
@@ -35,6 +37,11 @@ def convert(
         readable=True,
         help="YAML glossary with protect/pre/post rules",
     ),
+    punctuation: bool = typer.Option(
+        True,
+        "--punctuation/--no-punctuation",
+        help="Convert quote marks to the target convention (\"\" ↔ 「」)",
+    ),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     """Convert an EPUB between Chinese variants."""
@@ -48,6 +55,12 @@ def convert(
         engine = OpenCCEngine(source_lang, target_lang, config=opencc_config)
     else:
         raise typer.BadParameter(f"unknown engine: {engine_name}")
+
+    if punctuation:
+        mapping = punctuation_map_for(target_lang)
+        if mapping is not None:
+            logger.info(f"punctuation: rewriting {len(mapping)} quote marks for {target_lang}")
+            engine = PunctuationEngine(engine, mapping)
 
     if glossary_path is not None:
         glossary = Glossary.from_yaml(glossary_path)
