@@ -17,6 +17,7 @@ from .engines.punctuation_engine import PunctuationEngine
 from .formats.mobi import CalibreNotFoundError, epub_to_mobi
 from .glossary import Glossary
 from .pipeline import convert_epub
+from .series import list_series, load_series, series_path
 
 app = typer.Typer(
     add_completion=False,
@@ -39,6 +40,7 @@ def _build_engine(
     opencc_config: str | None,
     glossary_path: Path | None,
     punctuation: bool,
+    series: str | None = None,
 ) -> Engine:
     if engine_name == "opencc":
         engine: Engine = OpenCCEngine(source_lang, target_lang, config=opencc_config)
@@ -51,14 +53,22 @@ def _build_engine(
             logger.info(f"punctuation: rewriting {len(mapping)} quote marks for {target_lang}")
             engine = PunctuationEngine(engine, mapping)
 
+    glossary = Glossary.empty()
+    if series is not None:
+        try:
+            series_g = load_series(series)
+        except FileNotFoundError as exc:
+            raise typer.BadParameter(str(exc))
+        logger.info(f"series: {series} ({series_path(series)})")
+        glossary = glossary.merge(series_g)
     if glossary_path is not None:
-        glossary = Glossary.from_yaml(glossary_path)
-        if not glossary.is_empty():
-            logger.info(
-                f"glossary: {glossary_path.name} "
-                f"(protect={len(glossary.protect)}, pre={len(glossary.pre)}, post={len(glossary.post)})"
-            )
-            engine = GlossaryEngine(engine, glossary)
+        glossary = glossary.merge(Glossary.from_yaml(glossary_path))
+
+    if not glossary.is_empty():
+        logger.info(
+            f"glossary: protect={len(glossary.protect)} pre={len(glossary.pre)} post={len(glossary.post)}"
+        )
+        engine = GlossaryEngine(engine, glossary)
 
     return engine
 
@@ -79,6 +89,12 @@ def convert(
         dir_okay=False,
         readable=True,
         help="YAML glossary with protect/pre/post rules",
+    ),
+    series: str = typer.Option(
+        None,
+        "--series",
+        "-s",
+        help="Named series glossary from EPUBCONV_CONFIG_DIR/series/<name>.yaml",
     ),
     punctuation: bool = typer.Option(
         True,
@@ -110,7 +126,9 @@ def convert(
     if dst is None:
         dst = src.with_name(f"{src.stem}.{target_lang}.{output_format}")
 
-    engine = _build_engine(source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation)
+    engine = _build_engine(
+        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation, series=series
+    )
 
     if output_format == "epub":
         out = convert_epub(src, dst, engine, target_lang, writing_mode=writing_mode)
@@ -140,6 +158,7 @@ def diff(
     glossary_path: Path = typer.Option(
         None, "--glossary", "-g", exists=True, dir_okay=False, readable=True
     ),
+    series: str = typer.Option(None, "--series", "-s"),
     punctuation: bool = typer.Option(True, "--punctuation/--no-punctuation"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
@@ -147,7 +166,9 @@ def diff(
     _setup_logger(verbose)
     if output is None:
         output = src.with_name(f"{src.stem}.diff.html")
-    engine = _build_engine(source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation)
+    engine = _build_engine(
+        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation, series=series
+    )
     out = build_diff_report(src, engine, output)
     typer.echo(str(out))
 
@@ -157,6 +178,27 @@ def list_configs() -> None:
     """List supported OpenCC source -> target combinations."""
     for (s, t), cfg in sorted(OPENCC_CONFIGS.items()):
         typer.echo(f"{s:10s} -> {t:10s}  ({cfg})")
+
+
+series_app = typer.Typer(help="Manage series glossaries.", no_args_is_help=True)
+app.add_typer(series_app, name="series")
+
+
+@series_app.command("list")
+def series_list_cmd() -> None:
+    """List available series glossaries in the config directory."""
+    names = list_series()
+    if not names:
+        typer.echo("(no series glossaries found)")
+        return
+    for name in names:
+        typer.echo(f"{name}\t{series_path(name)}")
+
+
+@series_app.command("path")
+def series_path_cmd(name: str = typer.Argument(...)) -> None:
+    """Print the resolved path for a named series glossary."""
+    typer.echo(str(series_path(name)))
 
 
 if __name__ == "__main__":

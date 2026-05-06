@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -44,6 +44,19 @@ class Glossary:
 
     def is_empty(self) -> bool:
         return not (self.protect or self.pre or self.post)
+
+    def merge(self, other: "Glossary") -> "Glossary":
+        """Concatenate ``other`` after ``self``.
+
+        ``self``'s rules apply first; ``other``'s rules run after and can
+        therefore override (e.g. a series glossary defines a default term,
+        and a per-book glossary overrides it).
+        """
+        return Glossary(
+            protect=self.protect + other.protect,
+            pre=self.pre + other.pre,
+            post=self.post + other.post,
+        )
 
     def apply_pre(self, text: str) -> tuple[str, dict[str, str]]:
         """Apply pre rules and replace protected tokens with placeholders.
