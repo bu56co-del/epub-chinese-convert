@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from loguru import logger
 
+from .batch import run_batch
 from .converters.punctuation import punctuation_map_for
 from .converters.writing_mode import WRITING_MODES
 from .diff import build_diff_report
@@ -171,6 +172,43 @@ def diff(
     )
     out = build_diff_report(src, engine, output)
     typer.echo(str(out))
+
+
+@app.command()
+def batch(
+    inputs: Path = typer.Argument(..., exists=True, file_okay=False, help="Input directory"),
+    outputs: Path = typer.Argument(..., help="Output directory"),
+    source_lang: str = typer.Option("zh-CN", "--from", "-f"),
+    target_lang: str = typer.Option("zh-TW", "--to", "-t"),
+    engine_name: str = typer.Option("opencc", "--engine", "-e"),
+    opencc_config: str = typer.Option(None, "--opencc-config"),
+    glossary_path: Path = typer.Option(None, "--glossary", "-g", exists=True, dir_okay=False),
+    series: str = typer.Option(None, "--series", "-s"),
+    punctuation: bool = typer.Option(True, "--punctuation/--no-punctuation"),
+    writing_mode: str = typer.Option("preserve", "--writing-mode", "-w"),
+    no_resume: bool = typer.Option(False, "--no-resume", help="Re-convert files already marked done"),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Convert every EPUB under <inputs> into <outputs>, with resume."""
+    _setup_logger(verbose)
+    if writing_mode not in WRITING_MODES:
+        raise typer.BadParameter(f"writing-mode must be one of {WRITING_MODES}")
+
+    engine = _build_engine(
+        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation, series=series
+    )
+
+    def _convert(src: Path, dst: Path) -> Path:
+        return convert_epub(src, dst, engine, target_lang, writing_mode=writing_mode)
+
+    result = run_batch(inputs, outputs, _convert, resume=not no_resume)
+    typer.echo(
+        f"done={len(result.done)} skipped={len(result.skipped)} errored={len(result.errored)}"
+    )
+    if result.errored:
+        for src, err in result.errored:
+            typer.echo(f"  ERR {src}: {err}", err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command("list-configs")
