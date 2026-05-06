@@ -1,0 +1,63 @@
+# Convert every EPUB attached to a published release to zh-TW (and zh-HK)
+# and upload the converted files back to the same release.
+#
+# Repository secrets used (optional):
+#   BANANA2556_API_KEY  - enables LLM fallback via banana2556
+#   GEMINI_API_KEY      - enables LLM fallback via Gemini directly
+#
+# Variables you may want to tweak below:
+#   targets    - which Chinese variants to produce
+#   series     - the named series glossary (must exist under
+#                $EPUBCONV_CONFIG_DIR/series/<name>.yaml at runtime)
+#   llm        - leave empty to skip LLM fallback
+
+name: Convert release EPUBs
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -e ".[llm]"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p in out
+          gh release download "$TAG" --pattern "*.epub" --dir in
+          ls -la in
+
+      - name: Convert
+        env:
+          BANANA2556_API_KEY: ${{ secrets.BANANA2556_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          for target in zh-TW zh-HK; do
+            echo "::group::convert -> $target"
+            mkdir -p "out/$target"
+            epubconv batch in "out/$target" --from zh-CN --to "$target" \
+              ${{ secrets.BANANA2556_API_KEY && '--llm banana2556' || '' }}
+            echo "::endgroup::"
+          done
+
+      - name: Upload converted assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          find out -name '*.epub' -print0 \
+            | xargs -0 -I{} gh release upload "$TAG" "{}" --clobber

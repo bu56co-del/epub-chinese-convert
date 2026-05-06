@@ -1,0 +1,72 @@
+name: epubconv
+description: Convert EPUB files between Chinese variants (zh-CN / zh-TW / zh-HK / zh-Hant / zh-Hans).
+author: bu56co-del
+
+inputs:
+  src:
+    description: Source EPUB file or directory of EPUBs.
+    required: true
+  dst:
+    description: Output path or directory.
+    required: true
+  from:
+    description: Source language (zh-CN | zh-TW | zh-HK | zh-Hant | zh-Hans).
+    default: zh-CN
+  to:
+    description: Target language.
+    default: zh-TW
+  glossary:
+    description: Optional glossary YAML path.
+    required: false
+  series:
+    description: Optional named series glossary.
+    required: false
+  writing-mode:
+    description: preserve | horizontal | vertical.
+    default: preserve
+  llm:
+    description: LLM fallback provider (gemini | banana2556). Leave empty to skip.
+    required: false
+  llm-model:
+    description: Override default LLM model.
+    required: false
+
+outputs:
+  dst:
+    description: Resolved output path.
+    value: ${{ steps.run.outputs.dst }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - shell: bash
+      run: pip install "${{ github.action_path }}[llm]"
+    - id: run
+      shell: bash
+      env:
+        SRC: ${{ inputs.src }}
+        DST: ${{ inputs.dst }}
+        FROM: ${{ inputs.from }}
+        TO: ${{ inputs.to }}
+        GLOSSARY: ${{ inputs.glossary }}
+        SERIES: ${{ inputs.series }}
+        WMODE: ${{ inputs.writing-mode }}
+        LLM: ${{ inputs.llm }}
+        LLM_MODEL: ${{ inputs.llm-model }}
+      run: |
+        set -euo pipefail
+        args=(--from "$FROM" --to "$TO" --writing-mode "$WMODE")
+        [ -n "$GLOSSARY"  ] && args+=(--glossary "$GLOSSARY")
+        [ -n "$SERIES"    ] && args+=(--series   "$SERIES")
+        [ -n "$LLM"       ] && args+=(--llm      "$LLM")
+        [ -n "$LLM_MODEL" ] && args+=(--llm-model "$LLM_MODEL")
+
+        if [ -d "$SRC" ]; then
+          epubconv batch "$SRC" "$DST" "${args[@]}"
+        else
+          epubconv convert "$SRC" "$DST" "${args[@]}"
+        fi
+        echo "dst=$DST" >> "$GITHUB_OUTPUT"

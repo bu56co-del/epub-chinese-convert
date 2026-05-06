@@ -16,6 +16,7 @@ dependencies = [
     "typer>=0.12",
     "loguru>=0.7",
     "chardet>=5.2",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -23,9 +24,24 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
 ]
+llm = [
+    "openai>=1.30",
+]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "python-multipart>=0.0.9",
+]
 
 [project.scripts]
 epubconv = "epubconv.cli:app"
+
+# Third-party engines can register under this group:
+#   [project.entry-points."epubconv.engines"]
+#   fanhuaji = "myplugin.fanhuaji:make_engine"
+# Factory signature: (source: str, target: str, **kwargs) -> Engine.
+[project.entry-points."epubconv.engines"]
+opencc = "epubconv.engines.registry:_opencc_factory"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/epubconv"]
