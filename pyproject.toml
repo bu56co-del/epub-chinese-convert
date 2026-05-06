@@ -31,6 +31,13 @@ llm = [
 [project.scripts]
 epubconv = "epubconv.cli:app"
 
+# Third-party engines can register under this group:
+#   [project.entry-points."epubconv.engines"]
+#   fanhuaji = "myplugin.fanhuaji:make_engine"
+# Factory signature: (source: str, target: str, **kwargs) -> Engine.
+[project.entry-points."epubconv.engines"]
+opencc = "epubconv.engines.registry:_opencc_factory"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/epubconv"]
 

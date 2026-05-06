@@ -15,6 +15,7 @@ from .engines.base import Engine
 from .engines.glossary_engine import GlossaryEngine
 from .engines.opencc_engine import OPENCC_CONFIGS, OpenCCEngine
 from .engines.punctuation_engine import PunctuationEngine
+from .engines.registry import get_engine, list_engines
 from .engines.llm_fallback_engine import LLMFallbackEngine
 from .formats.mobi import CalibreNotFoundError, epub_to_mobi
 from .glossary import Glossary
@@ -48,10 +49,12 @@ def _build_engine(
     llm_model: str | None = None,
     llm_cache_path: Path | None = None,
 ) -> Engine:
-    if engine_name == "opencc":
-        engine: Engine = OpenCCEngine(source_lang, target_lang, config=opencc_config)
-    else:
-        raise typer.BadParameter(f"unknown engine: {engine_name}")
+    try:
+        engine: Engine = get_engine(
+            engine_name, source_lang, target_lang, opencc_config=opencc_config
+        )
+    except (ValueError, TypeError) as exc:
+        raise typer.BadParameter(str(exc))
 
     if llm_provider:
         from .llm.cache import DEFAULT_CACHE_PATH, Cache
@@ -271,6 +274,13 @@ def list_configs() -> None:
     """List supported OpenCC source -> target combinations."""
     for (s, t), cfg in sorted(OPENCC_CONFIGS.items()):
         typer.echo(f"{s:10s} -> {t:10s}  ({cfg})")
+
+
+@app.command("list-engines")
+def list_engines_cmd() -> None:
+    """List builtin engines + any third-party plugins discovered via entry points."""
+    for name in list_engines():
+        typer.echo(name)
 
 
 series_app = typer.Typer(help="Manage series glossaries.", no_args_is_help=True)
