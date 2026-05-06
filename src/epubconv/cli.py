@@ -17,6 +17,7 @@ from .engines.opencc_engine import OPENCC_CONFIGS, OpenCCEngine
 from .engines.punctuation_engine import PunctuationEngine
 from .formats.mobi import CalibreNotFoundError, epub_to_mobi
 from .glossary import Glossary
+from .names import extract_candidates
 from .pipeline import convert_epub
 from .series import list_series, load_series, series_path
 
@@ -209,6 +210,32 @@ def batch(
         for src, err in result.errored:
             typer.echo(f"  ERR {src}: {err}", err=True)
         raise typer.Exit(code=1)
+
+
+@app.command("extract-names")
+def extract_names_cmd(
+    src: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    output: Path = typer.Option(
+        None, "--output", "-o", help="Write a glossary YAML stub (default: stdout)"
+    ),
+    min_occurrences: int = typer.Option(3, "--min", help="Minimum occurrences across the book"),
+    top: int = typer.Option(100, "--top", help="Limit to top N candidates"),
+) -> None:
+    """Suggest proper-noun candidates from <src>'s text.
+
+    Output is intentionally noisy — review and prune before pasting into a
+    glossary's ``protect`` list.
+    """
+    candidates = extract_candidates(src, min_occurrences=min_occurrences)[:top]
+    if output is None:
+        for token, count in candidates:
+            typer.echo(f"{count:5d}  {token}")
+        return
+    lines = ["# epubconv extract-names: review and edit before use", "protect:"]
+    for token, count in candidates:
+        lines.append(f"  - {token}    # x{count}")
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    typer.echo(str(output))
 
 
 @app.command("list-configs")
