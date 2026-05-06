@@ -283,6 +283,19 @@ def list_engines_cmd() -> None:
         typer.echo(name)
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+) -> None:
+    """Run the local web UI (requires `pip install epubconv[web]`)."""
+    try:
+        import uvicorn
+    except ImportError:
+        raise typer.BadParameter("uvicorn missing. Install with: pip install epubconv[web]")
+    uvicorn.run("epubconv.web.server:app", host=host, port=port, log_level="info")
+
+
 series_app = typer.Typer(help="Manage series glossaries.", no_args_is_help=True)
 app.add_typer(series_app, name="series")
 

@@ -27,6 +27,11 @@ dev = [
 llm = [
     "openai>=1.30",
 ]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "python-multipart>=0.0.9",
+]
 
 [project.scripts]
 epubconv = "epubconv.cli:app"
