@@ -15,6 +15,7 @@ from .engines.base import Engine
 from .engines.glossary_engine import GlossaryEngine
 from .engines.opencc_engine import OPENCC_CONFIGS, OpenCCEngine
 from .engines.punctuation_engine import PunctuationEngine
+from .engines.llm_fallback_engine import LLMFallbackEngine
 from .formats.mobi import CalibreNotFoundError, epub_to_mobi
 from .glossary import Glossary
 from .names import extract_candidates
@@ -43,11 +44,26 @@ def _build_engine(
     glossary_path: Path | None,
     punctuation: bool,
     series: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_cache_path: Path | None = None,
 ) -> Engine:
     if engine_name == "opencc":
         engine: Engine = OpenCCEngine(source_lang, target_lang, config=opencc_config)
     else:
         raise typer.BadParameter(f"unknown engine: {engine_name}")
+
+    if llm_provider:
+        from .llm.cache import DEFAULT_CACHE_PATH, Cache
+        from .llm.client import LLMClient, LLMConfig
+        try:
+            cfg = LLMConfig.for_provider(llm_provider, model=llm_model)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc))
+        client = LLMClient(cfg)
+        cache = Cache(llm_cache_path or DEFAULT_CACHE_PATH)
+        logger.info(f"llm: {llm_provider} model={cfg.model} cache={cache.path} (entries={len(cache)})")
+        engine = LLMFallbackEngine(engine, client, target_lang, cache)
 
     if punctuation:
         mapping = punctuation_map_for(target_lang)
@@ -115,6 +131,9 @@ def convert(
         "-F",
         help=f"Output format: one of {OUTPUT_FORMATS} (mobi requires Calibre)",
     ),
+    llm: str = typer.Option(None, "--llm", help="LLM fallback provider: gemini | banana2556"),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override default model"),
+    llm_cache: Path = typer.Option(None, "--llm-cache", help="LLM response cache path"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     """Convert an EPUB between Chinese variants."""
@@ -129,7 +148,8 @@ def convert(
         dst = src.with_name(f"{src.stem}.{target_lang}.{output_format}")
 
     engine = _build_engine(
-        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation, series=series
+        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation,
+        series=series, llm_provider=llm, llm_model=llm_model, llm_cache_path=llm_cache,
     )
 
     if output_format == "epub":
@@ -162,6 +182,9 @@ def diff(
     ),
     series: str = typer.Option(None, "--series", "-s"),
     punctuation: bool = typer.Option(True, "--punctuation/--no-punctuation"),
+    llm: str = typer.Option(None, "--llm"),
+    llm_model: str = typer.Option(None, "--llm-model"),
+    llm_cache: Path = typer.Option(None, "--llm-cache"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     """Render a side-by-side HTML diff without writing an output EPUB."""
@@ -169,7 +192,8 @@ def diff(
     if output is None:
         output = src.with_name(f"{src.stem}.diff.html")
     engine = _build_engine(
-        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation, series=series
+        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation,
+        series=series, llm_provider=llm, llm_model=llm_model, llm_cache_path=llm_cache,
     )
     out = build_diff_report(src, engine, output)
     typer.echo(str(out))
@@ -188,6 +212,9 @@ def batch(
     punctuation: bool = typer.Option(True, "--punctuation/--no-punctuation"),
     writing_mode: str = typer.Option("preserve", "--writing-mode", "-w"),
     no_resume: bool = typer.Option(False, "--no-resume", help="Re-convert files already marked done"),
+    llm: str = typer.Option(None, "--llm"),
+    llm_model: str = typer.Option(None, "--llm-model"),
+    llm_cache: Path = typer.Option(None, "--llm-cache"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     """Convert every EPUB under <inputs> into <outputs>, with resume."""
@@ -196,7 +223,8 @@ def batch(
         raise typer.BadParameter(f"writing-mode must be one of {WRITING_MODES}")
 
     engine = _build_engine(
-        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation, series=series
+        source_lang, target_lang, engine_name, opencc_config, glossary_path, punctuation,
+        series=series, llm_provider=llm, llm_model=llm_model, llm_cache_path=llm_cache,
     )
 
     def _convert(src: Path, dst: Path) -> Path:
