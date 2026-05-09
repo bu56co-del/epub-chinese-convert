@@ -70,6 +70,39 @@ epubconv batch ./my-books ./out --to zh-TW
 
 State lives in `out/.epubconv-batch.json`. Pass `--no-resume` to force re-conversion.
 
+### Export an EPUB as a Claude Skill
+
+Turn a book into a Claude Skill directory that Claude can search by `grep`:
+
+```bash
+epubconv export-skill book.epub ./skills --to zh-TW
+# writes ./skills/<slug>/{SKILL.md, data.jsonl, index.json, manifest.json}
+cp -r ./skills/<slug> ~/.claude/skills/
+```
+
+The skill bundles:
+
+- **`data.jsonl`** — one section per line, fields: `id`, `chapter_index`,
+  `chapter_num` (normalised integer; `第十二章` → 12), `chapter_title`,
+  `heading_path` (TOC nesting), `section_index`, `text`, `char_count`,
+  `source_sha256`. Text is converted to the target Chinese variant.
+- **`index.json`** — `id` → byte offset and `chapter_title` → `[ids]`,
+  so Claude can jump to a specific record without scanning.
+- **`manifest.json`** — source EPUB hash, book metadata, target language.
+- **`SKILL.md`** — frontmatter (`name`, `description` with trigger
+  phrases) + a how-to-query body that points Claude at `data.jsonl`.
+
+Chapter boundaries come from `nav.xhtml` (EPUB 3) or `toc.ncx` (EPUB 2);
+spine order is the fallback. Cover, colophon, and TOC files are excluded.
+Runs are deterministic — same EPUB and target give identical bytes.
+
+```
+--name <slug>            override the slugified <dc:title>
+--chunk-size <chars>     default 1500
+--description <text>     override the auto-generated description
+--keep-footnotes         inline <aside epub:type="footnote"> instead of dropping
+```
+
 ### Suggest proper-noun candidates
 
 Heuristic name extraction so you don't have to scan a whole book by hand:

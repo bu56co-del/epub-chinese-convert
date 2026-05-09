@@ -22,6 +22,7 @@ from .glossary import Glossary
 from .names import extract_candidates
 from .pipeline import convert_epub
 from .series import list_series, load_series, series_path
+from .skill.exporter import export_skill
 
 app = typer.Typer(
     add_completion=False,
@@ -241,6 +242,31 @@ def batch(
         for src, err in result.errored:
             typer.echo(f"  ERR {src}: {err}", err=True)
         raise typer.Exit(code=1)
+
+
+@app.command("export-skill")
+def export_skill_cmd(
+    src: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="Source EPUB"),
+    output_dir: Path = typer.Argument(Path("."), help="Parent dir; skill goes into <output_dir>/<slug>"),
+    target_lang: str = typer.Option("zh-TW", "--to", "-t", help="Target Chinese variant for the JSONL"),
+    name: str = typer.Option(None, "--name", help="Override the skill slug (default: slug of <dc:title>)"),
+    chunk_size: int = typer.Option(1500, "--chunk-size", help="Max chars per JSONL record"),
+    description: str = typer.Option(None, "--description", help="Override the auto-generated SKILL.md description"),
+    keep_footnotes: bool = typer.Option(False, "--keep-footnotes", help="Inline footnotes instead of dropping them"),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Turn an EPUB into a Claude Skill directory (SKILL.md + JSONL knowledge base)."""
+    _setup_logger(verbose)
+    result = export_skill(
+        src,
+        output_dir,
+        target_lang=target_lang,
+        name=name,
+        chunk_size=chunk_size,
+        description_override=description,
+        keep_footnotes=keep_footnotes,
+    )
+    typer.echo(str(result.out_dir))
 
 
 @app.command("extract-names")
