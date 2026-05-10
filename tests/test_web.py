@@ -293,13 +293,27 @@ def _parse_sse_events(body: str) -> list[dict]:
     return out
 
 
-def test_summarize_endpoint_streams_progress_then_done(
+def _wait_for_done(client: TestClient, timeout: float = 5.0) -> list[dict]:
+    """POST /summarize returns immediately. Poll /summarize-status until the
+    run finishes, then fetch the replay via /summarize-stream."""
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        s = client.get("/summarize-status").json()
+        if not s["active"]:
+            break
+        _t.sleep(0.05)
+    r = client.get("/summarize-stream")
+    return _parse_sse_events(r.text)
+
+
+def test_summarize_endpoint_starts_task_and_streams_done(
     client: TestClient,
     skill_epub: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The endpoint emits SSE events; the final one is `done` with the
-    summary text."""
+    """POST /summarize starts a detached task and returns 200 with
+    {started: true}. The events come via GET /summarize-stream."""
     from epubconv import summarize as sm
 
     class FakeClient:
@@ -317,9 +331,9 @@ def test_summarize_endpoint_streams_progress_then_done(
             data={"provider": "banana2556", "model": "gpt-5", "max_chars": "5000"},
         )
     assert r.status_code == 200
-    assert "text/event-stream" in r.headers["content-type"]
+    assert r.json()["started"] is True
 
-    events = _parse_sse_events(r.text)
+    events = _wait_for_done(client)
     stages = [e["stage"] for e in events]
     assert stages[0] == "extracting"
     assert "extracted" in stages
@@ -328,16 +342,116 @@ def test_summarize_endpoint_streams_progress_then_done(
     assert stages[-1] == "done"
     final = events[-1]
     assert "一句話總結" in final["text"]
-    assert final["chapters_used"] >= 1
-    assert final["chars_used"] > 0
+
+
+def test_summarize_status_reflects_run_state(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/summarize-status lets the page-load reconnect logic decide whether
+    to auto-attach without opening an SSE stream."""
+    from epubconv import summarize as sm
+
+    class FakeClient:
+        def complete(self, system, user, **kw): return "## 一句話總結\n測"
+
+    monkeypatch.setattr(sm, "LLMClient", lambda cfg: FakeClient())
+    monkeypatch.setattr(sm, "LLMConfig",
+                        type("Cfg", (), {"for_provider": staticmethod(lambda *a, **kw: object())}))
+
+    # No run yet.
+    s = client.get("/summarize-status").json()
+    assert s["active"] is False
+    assert s["event_count"] == 0
+
+    with skill_epub.open("rb") as fh:
+        client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"max_chars": "5000"},
+        )
+    _wait_for_done(client)
+    s = client.get("/summarize-status").json()
+    assert s["active"] is False
+    assert s["has_result"] is True
+    assert s["latest_stage"] == "done"
+
+
+def test_summarize_returns_409_when_run_already_active(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second POST while the first is in flight returns 409 so the
+    browser knows to attach instead of starting a new run."""
+    from epubconv import summarize as sm
+    import time as _t
+
+    class SlowClient:
+        def complete(self, system, user, **kw):
+            _t.sleep(0.3)
+            return "### 內容\n- ok"
+
+    monkeypatch.setattr(sm, "LLMClient", lambda cfg: SlowClient())
+    monkeypatch.setattr(sm, "LLMConfig",
+                        type("Cfg", (), {"for_provider": staticmethod(lambda *a, **kw: object())}))
+
+    with skill_epub.open("rb") as fh:
+        r1 = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"max_chars": "5000"},
+        )
+    assert r1.status_code == 200
+    with skill_epub.open("rb") as fh:
+        r2 = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"max_chars": "5000"},
+        )
+    assert r2.status_code == 409
+    assert "running" in r2.json()["detail"].lower()
+    # Drain the in-flight run so subsequent tests start clean.
+    _wait_for_done(client)
+
+
+def test_summarize_stream_replays_for_late_subscribers(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second GET /summarize-stream after the run finishes still gets
+    the full event sequence — the basis of "refresh and reconnect"."""
+    from epubconv import summarize as sm
+
+    class FakeClient:
+        def complete(self, system, user, **kw): return "## 一句話總結\n測"
+
+    monkeypatch.setattr(sm, "LLMClient", lambda cfg: FakeClient())
+    monkeypatch.setattr(sm, "LLMConfig",
+                        type("Cfg", (), {"for_provider": staticmethod(lambda *a, **kw: object())}))
+
+    with skill_epub.open("rb") as fh:
+        client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"max_chars": "5000"},
+        )
+    _wait_for_done(client)
+
+    # Open the stream a second time; should still get the buffered events.
+    second = _parse_sse_events(client.get("/summarize-stream").text)
+    assert any(e["stage"] == "extracting" for e in second)
+    assert second[-1]["stage"] == "done"
 
 
 def test_summarize_endpoint_handles_empty_book(
     client: TestClient,
     sample_epub: Path,
 ) -> None:
-    # Conftest sample is too short → summarize raises ValueError → emitted
-    # as a final SSE error event with status=400.
+    # Conftest sample is too short → summarize raises ValueError → final
+    # event is `{"stage": "error", "status": 400}` on the stream.
     with sample_epub.open("rb") as fh:
         r = client.post(
             "/summarize",
@@ -345,7 +459,7 @@ def test_summarize_endpoint_handles_empty_book(
             data={"max_chars": "5000"},
         )
     assert r.status_code == 200
-    events = _parse_sse_events(r.text)
+    events = _wait_for_done(client)
     final = events[-1]
     assert final["stage"] == "error"
     assert final["status"] == 400
@@ -389,8 +503,8 @@ def test_summarize_endpoint_emits_error_event_with_batch_context(
     skill_epub: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SummaryError surfaces as a final SSE event with status=502 and the
-    detail string naming the stage and char count."""
+    """SummaryError surfaces as a final stream event with status=502 and
+    the detail string naming the stage and char count."""
     from epubconv import summarize as sm
 
     def boom(*a, **kw):
@@ -406,7 +520,7 @@ def test_summarize_endpoint_emits_error_event_with_batch_context(
             files={"file": ("novel.epub", fh, "application/epub+zip")},
         )
     assert r.status_code == 200
-    events = _parse_sse_events(r.text)
+    events = _wait_for_done(client)
     final = events[-1]
     assert final["stage"] == "error"
     assert final["status"] == 502

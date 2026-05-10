@@ -363,7 +363,7 @@ INDEX_HTML = """<!DOCTYPE html>
     );
   });
 
-  // -------- Summary (SSE-streamed progress) --------
+  // -------- Summary (detached background task with reconnect) --------
   const summaryForm = document.getElementById("f-summary");
   const summaryStatus = document.getElementById("summary-status");
   const summaryOut = document.getElementById("summary-out");
@@ -399,6 +399,9 @@ INDEX_HTML = """<!DOCTYPE html>
       summaryBar.value = 99;
       summaryProgressText.textContent =
         `All batches done. Combining ${fmt(ev.notes_chars)} chars of notes into final summary…`;
+    } else if (ev.stage === "combine_split") {
+      summaryProgressText.textContent =
+        `Combine too long at depth ${ev.depth} — bisecting ${ev.notes_in} notes (${fmt(ev.notes_chars)} chars)…`;
     } else if (ev.stage === "combine_done") {
       summaryBar.value = 100;
     } else if (ev.stage === "done") {
@@ -417,7 +420,64 @@ INDEX_HTML = """<!DOCTYPE html>
         }
       }
       summaryStatus.textContent = msg;
-      summaryProgress.style.display = "none";
+    }
+  }
+
+  async function attachSummaryStream() {
+    summaryProgress.style.display = "block";
+    let reconnectDelay = 1000;
+    while (true) {
+      let r;
+      try {
+        r = await fetch("/summarize-stream", { cache: "no-store" });
+      } catch (e) {
+        // Network error — back off and retry.
+        summaryProgressText.textContent =
+          `Disconnected (${e}). Reconnecting in ${reconnectDelay/1000}s…`;
+        await new Promise(res => setTimeout(res, reconnectDelay));
+        reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+        continue;
+      }
+      if (!r.ok) {
+        summaryStatus.textContent = "Stream error: HTTP " + r.status;
+        return;
+      }
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let terminalSeen = false;
+      while (true) {
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (e) {
+          // Reader broke mid-stream — reconnect.
+          summaryProgressText.textContent =
+            `Stream dropped (${e}). Reconnecting…`;
+          break;
+        }
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        let parts = buf.split("\\n\\n");
+        buf = parts.pop();
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line || line.startsWith(":")) continue;  // keepalive
+          if (!line.startsWith("data:")) continue;
+          try {
+            const ev = JSON.parse(line.slice(5).trim());
+            handleSummaryEvent(ev);
+            if (ev.stage === "done" || ev.stage === "error") {
+              terminalSeen = true;
+            }
+          } catch (e) {
+            console.warn("bad SSE event:", line, e);
+          }
+        }
+      }
+      if (terminalSeen) return;
+      // Otherwise: reconnect to pick up where we left off.
+      reconnectDelay = 1000;
     }
   }
 
@@ -442,34 +502,37 @@ INDEX_HTML = """<!DOCTYPE html>
       summaryProgress.style.display = "none";
       return;
     }
+    if (r.status === 409) {
+      // A run is already going — just attach.
+      summaryProgressText.textContent =
+        "A summarisation is already running — attaching to its stream…";
+      attachSummaryStream();
+      return;
+    }
     if (!r.ok) {
-      const fallback = await r.text();
-      summaryStatus.textContent = "Error " + r.status + ": " + fallback.slice(0, 240);
+      const text = await r.text();
+      summaryStatus.textContent = "Error " + r.status + ": " + text.slice(0, 240);
       summaryProgress.style.display = "none";
       return;
     }
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let parts = buf.split("\\n\\n");
-      buf = parts.pop();
-      for (const part of parts) {
-        const line = part.trim();
-        if (!line.startsWith("data:")) continue;
-        try {
-          const ev = JSON.parse(line.slice(5).trim());
-          handleSummaryEvent(ev);
-        } catch (e) {
-          console.warn("bad SSE event:", line, e);
-        }
-      }
-    }
+    attachSummaryStream();
   });
+
+  // On page load, peek at server status — if a run is in progress (or
+  // just finished and we never saw the result), auto-attach to replay.
+  (async () => {
+    try {
+      const r = await fetch("/summarize-status", { cache: "no-store" });
+      if (!r.ok) return;
+      const s = await r.json();
+      if (s.active || s.has_result) {
+        summaryProgressText.textContent = s.active
+          ? "Reattaching to in-progress summarisation…"
+          : "Replaying the last summarisation…";
+        attachSummaryStream();
+      }
+    } catch (e) { /* offline; nothing to do */ }
+  })();
 
   // -------- Settings (localStorage only) --------
   const settingsForm = document.getElementById("f-settings");
@@ -843,6 +906,48 @@ def create_app() -> FastAPI:
         build_diff_report(src, engine, report)
         return report.read_text(encoding="utf-8")
 
+    # --- detached summarisation task ----------------------------------
+    # Only one run at a time. Survives browser disconnects so users can
+    # close the tab / refresh and reconnect without losing progress.
+    summary_run: dict[str, object] = {
+        "active": False,
+        "events": [],            # list of dicts emitted so far (replay buffer)
+        "subscribers": [],       # list of (asyncio.Queue, asyncio.AbstractEventLoop)
+        "started_at": 0.0,
+    }
+
+    def _emit_summary_event(event: dict) -> None:
+        """Called from the worker thread; bridges into each subscriber's loop."""
+        summary_run["events"].append(event)
+        for q, loop in list(summary_run["subscribers"]):
+            try:
+                asyncio.run_coroutine_threadsafe(q.put(event), loop)
+            except RuntimeError:
+                pass  # loop closed; subscriber will be cleaned up on its end
+
+    def _summary_worker(src: Path, **kwargs) -> None:
+        try:
+            def progress(stage: str, data) -> None:
+                _emit_summary_event({"stage": stage, **dict(data)})
+            result = summarise_epub(src, progress=progress, **kwargs)
+            _emit_summary_event({
+                "stage": "done",
+                "text": result.text,
+                "chars_used": result.chars_used,
+                "chapters_used": result.chapters_used,
+            })
+        except ValueError as exc:
+            logger.warning("summarize task: 400 {exc}", exc=exc)
+            _emit_summary_event({"stage": "error", "status": 400, "detail": str(exc)})
+        except SummaryError as exc:
+            logger.error("summarize task: 502 {exc}", exc=exc)
+            _emit_summary_event({"stage": "error", "status": 502, "detail": str(exc)})
+        except Exception as exc:
+            logger.exception("summarize task: unexpected error")
+            _emit_summary_event({"stage": "error", "status": 500, "detail": f"{type(exc).__name__}: {exc}"})
+        finally:
+            summary_run["active"] = False
+
     @app.post("/summarize")
     async def summarize_endpoint(
         file: UploadFile = File(...),
@@ -851,15 +956,23 @@ def create_app() -> FastAPI:
         max_chars: int = Form(800_000),
         per_call_budget: int = Form(20_000),
         api_key: str = Form(""),
-    ) -> StreamingResponse:
-        """Stream Server-Sent Events with stage-by-stage progress.
+    ) -> JSONResponse:
+        """Start a detached summarisation task and return immediately.
 
-        Each event is one ``data: <json>\\n\\n`` block. Stages: extracting /
-        extracted / batch_start / batch_done / halve / combine_start /
-        combine_done / done / error. The browser builds a progress bar
-        from the chars_processed / chars_total fields without us having
-        to know the batch count up front (it changes on every halve).
+        The browser then opens GET /summarize-stream to receive progress
+        events. The run survives browser disconnects, so closing the tab,
+        refreshing, or losing network briefly does NOT cancel it — just
+        re-attach to /summarize-stream and the buffered events replay.
+
+        If a run is already in flight, returns 409 with a hint to attach
+        to the existing stream rather than start a new one.
         """
+        if summary_run["active"]:
+            raise HTTPException(
+                status_code=409,
+                detail="A summarisation is already running — attach to /summarize-stream to follow it.",
+            )
+
         upload_name = file.filename or "input.epub"
         tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-summary-"))
         src = tmp_dir / upload_name
@@ -870,54 +983,84 @@ def create_app() -> FastAPI:
             mc=max_chars, pb=per_call_budget,
         )
 
+        # Reset replay buffer for this new run.
+        summary_run["active"] = True
+        summary_run["events"] = []
+        summary_run["subscribers"] = []
+        summary_run["started_at"] = __import__("time").time()
+
+        threading.Thread(
+            target=_summary_worker,
+            args=(src,),
+            kwargs=dict(
+                max_chars=max_chars,
+                per_call_budget=per_call_budget,
+                provider=provider,
+                model=model or None,
+                api_key=api_key or None,
+            ),
+            daemon=True,
+        ).start()
+        return JSONResponse({"started": True, "started_at": summary_run["started_at"]})
+
+    @app.get("/summarize-stream")
+    async def summarize_stream() -> StreamingResponse:
+        """Attach to the in-flight summary task (or the just-finished one).
+
+        Replays every event from the start of the current run, then streams
+        new ones as they arrive. Multiple browsers can attach; closing one
+        does not cancel the run.
+        """
         loop = asyncio.get_running_loop()
-        events: asyncio.Queue = asyncio.Queue()
-        END = object()
+        queue: asyncio.Queue = asyncio.Queue()
+        subscriber = (queue, loop)
+        summary_run["subscribers"].append(subscriber)
 
-        def on_progress(stage: str, data) -> None:
-            """Called from the worker thread; bridges into the asyncio loop."""
-            asyncio.run_coroutine_threadsafe(events.put({"stage": stage, **dict(data)}), loop)
-
-        def worker() -> None:
+        async def stream():
             try:
-                result = summarise_epub(
-                    src,
-                    max_chars=max_chars,
-                    per_call_budget=per_call_budget,
-                    provider=provider,
-                    model=model or None,
-                    api_key=api_key or None,
-                    progress=on_progress,
-                )
-                on_progress("done", {
-                    "text": result.text,
-                    "chars_used": result.chars_used,
-                    "chapters_used": result.chapters_used,
-                })
-            except ValueError as exc:
-                logger.warning("summarize endpoint: 400 {exc}", exc=exc)
-                on_progress("error", {"status": 400, "detail": str(exc)})
-            except SummaryError as exc:
-                logger.error("summarize endpoint: 502 {exc}", exc=exc)
-                on_progress("error", {"status": 502, "detail": str(exc)})
-            except Exception as exc:
-                logger.exception("summarize endpoint: unexpected error")
-                on_progress("error", {"status": 500, "detail": f"{type(exc).__name__}: {exc}"})
+                # Replay buffered events first.
+                replayed_terminal = False
+                for ev in list(summary_run["events"]):
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    if ev.get("stage") in ("done", "error"):
+                        replayed_terminal = True
+                if replayed_terminal:
+                    return
+
+                # Stream new events.
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        # Keepalive comment so reverse proxies / browsers
+                        # don't close the idle connection during slow LLM calls.
+                        yield ": keepalive\n\n"
+                        if not summary_run["active"]:
+                            return
+                        continue
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    if ev.get("stage") in ("done", "error"):
+                        return
             finally:
-                asyncio.run_coroutine_threadsafe(events.put(END), loop)
+                try:
+                    summary_run["subscribers"].remove(subscriber)
+                except ValueError:
+                    pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        return StreamingResponse(stream(), media_type="text/event-stream")
 
-        async def event_stream():
-            while True:
-                event = await events.get()
-                if event is END:
-                    break
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event.get("stage") in ("done", "error"):
-                    break
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    @app.get("/summarize-status")
+    def summarize_status() -> JSONResponse:
+        """Lightweight peek for page-load reconnect logic."""
+        events = summary_run["events"]
+        latest = events[-1] if events else None
+        return JSONResponse({
+            "active": bool(summary_run["active"]),
+            "started_at": summary_run["started_at"],
+            "event_count": len(events),
+            "latest_stage": latest.get("stage") if latest else None,
+            "has_result": any(e.get("stage") == "done" for e in events),
+        })
 
     return app
 
