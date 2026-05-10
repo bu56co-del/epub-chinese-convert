@@ -564,6 +564,59 @@ def test_combine_handles_oversize_single_note(
     assert splits, "expected at least one combine_split event"
 
 
+def test_combine_halves_budget_when_proxy_rejects_a_fitting_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Our budget estimate may be looser than the proxy's real cap. When
+    that happens, the combine call should halve the budget and re-pack
+    rather than giving up."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    class RejectsLargeButAcceptsSmall:
+        def __init__(self) -> None:
+            self.calls = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.calls += 1
+            if len(user) > 700:
+                raise RuntimeError("Upstream error: Single message too long")
+            return "OK"
+
+    client = RejectsLargeButAcceptsSmall()
+    out = summarize._hierarchical_combine(
+        ["A" * 200, "B" * 200, "C" * 200],
+        client=client, cache=cache, on_progress=lambda *a: None,
+        budget=1500,  # initial notes_budget = 750; combined notes ~ 600 so first call goes through ... but 600+template > 700
+        depth=0, max_depth=10,
+    )
+    assert out == "OK"
+    # We should have made multiple calls — the budget halved at least once.
+    assert client.calls >= 2
+
+
+def test_combine_no_max_depth_ceiling_when_progress_possible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hard-split should keep working even at deep depth so we never
+    hit the previous "depth >= max_depth → raise" trap."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 10)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    class OkClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            return "OK"
+
+    # Start ALREADY at depth 5 (close to old max_depth=8), with one big note.
+    out = summarize._hierarchical_combine(
+        ["X" * 8000],
+        client=OkClient(), cache=cache, on_progress=lambda *a: None,
+        budget=1000, depth=5, max_depth=16,
+    )
+    assert out == "OK"
+
+
 def test_progress_callback_chars_processed_advances(tmp_path: Path) -> None:
     epub = _build_book(tmp_path)
     progress: list[tuple[str, int, int]] = []

@@ -401,8 +401,10 @@ def _summarise_long(
 
 # How much of the per-call budget is reserved for the actual notes payload
 # (the rest is template wrapping + system prompt + room for the model's
-# output before the proxy enforces its limit).
-_COMBINE_PAYLOAD_RATIO = 0.7
+# output before the proxy enforces its limit). Empirically, banana2556's
+# claude-haiku-4.5-as alias caps below 16K chars per *message* even when
+# the per_call_budget UI input is 20K — keep the reservation conservative.
+_COMBINE_PAYLOAD_RATIO = 0.5
 
 
 def _hierarchical_combine(
@@ -413,34 +415,34 @@ def _hierarchical_combine(
     on_progress: ProgressFn,
     budget: int,
     depth: int = 0,
-    max_depth: int = 8,
+    max_depth: int = 16,
 ) -> str:
     """Combine batch notes into the final structured summary.
 
     Strategy: budget-aware packing rather than blind bisection.
 
-    1. Compute the *per-call* notes budget (``budget * 0.7``) — leaves room
-       for the combine template wrapper + system prompt + the model's
-       output before the proxy enforces its per-message limit.
-    2. If the joined notes already fit, call the LLM once.
+    1. Compute the *per-call* notes budget (``budget * _COMBINE_PAYLOAD_RATIO``).
+    2. If the joined notes already fit, call the LLM. On a "too long"
+       error we don't fail — the proxy's real cap is tighter than our
+       estimate, so we halve ``budget`` and recurse.
     3. Otherwise pack notes greedily into groups whose joined size is
        within budget, combine each group into a sub-summary, then recurse
-       on the resulting (much smaller) list of sub-summaries.
-    4. If a *single* note alone exceeds the budget — possible when an
-       earlier sub-summary is verbose — hard-split it into budget-sized
-       slices and treat them as separate notes for the next round.
+       on the resulting (smaller) list of sub-summaries.
+    4. If a *single* note alone exceeds the budget we hard-split its text
+       into budget-sized slices and treat them as separate notes for the
+       next round. This guarantees forward progress even when the model's
+       own output won't shrink.
 
-    The post-call ``too long`` handler is now a backup for when the proxy's
-    real limit is tighter than our estimate; it triggers another packing
-    round at a more conservative budget, never giving up at exactly
-    ``max_depth`` while progress is still being made.
+    ``max_depth`` is a soft ceiling for runaway costs; the *real* stop
+    condition is "budget below ``_MIN_BATCH_BUDGET``" — at that point
+    nothing the model can accept.
     """
     notes_budget = max(1, int(budget * _COMBINE_PAYLOAD_RATIO))
     merged = "\n\n".join(notes)
     stage = f"combine@d{depth}"
 
     fits = len(merged) <= notes_budget
-    if fits or depth >= max_depth:
+    if fits:
         prompt = _COMBINE_TEMPLATE.format(notes=merged)
         try:
             return _cached_call(
@@ -449,23 +451,47 @@ def _hierarchical_combine(
                 batch_chars=len(merged),
             )
         except SummaryError as exc:
-            if depth >= max_depth or not _looks_too_long(exc) or len(notes) <= 1:
+            if not _looks_too_long(exc):
                 raise
-            # Fall through to splitting at a tighter budget.
+            new_budget = budget // 2
+            if new_budget < _MIN_BATCH_BUDGET:
+                logger.error(
+                    "summarise[{stage}]: floor reached (budget {old} → {new} < {min}); giving up",
+                    stage=stage, old=budget, new=new_budget, min=_MIN_BATCH_BUDGET,
+                )
+                raise
             logger.warning(
-                "summarise[{stage}]: estimate said {fits} but proxy rejected "
-                "{chars} chars — repacking at half budget",
-                stage=stage, fits="OK" if fits else "OVER", chars=len(merged),
+                "summarise[{stage}]: estimate fit but proxy rejected {chars} chars — "
+                "halving budget {old}→{new} and re-packing",
+                stage=stage, chars=len(merged), old=budget, new=new_budget,
             )
-            budget = budget // 2
+            return _hierarchical_combine(
+                notes, client=client, cache=cache, on_progress=on_progress,
+                budget=new_budget, depth=depth + 1, max_depth=max_depth,
+            )
 
-    # ---- pack / split ----
-    notes_budget = max(1, int(budget * _COMBINE_PAYLOAD_RATIO))
+    # ---- doesn't fit: pack and recurse ----
+    if depth >= max_depth:
+        logger.error(
+            "summarise[{stage}]: max_depth {max} reached with {n} notes ({chars} chars); "
+            "calling anyway as a last resort",
+            stage=stage, max=max_depth, n=len(notes), chars=len(merged),
+        )
+        # As a last resort try the call; let it fail with a real upstream error
+        # rather than recursing infinitely.
+        prompt = _COMBINE_TEMPLATE.format(notes=merged)
+        return _cached_call(
+            client, cache, "combine", merged,
+            stage_label=stage, system=_SYSTEM_PROMPT, user=prompt,
+            batch_chars=len(merged),
+        )
+
     groups = _pack_notes_under_budget(notes, notes_budget)
 
     if len(groups) == 1 and len(groups[0]) == 1:
         # A single note is bigger than the budget. Slice it by chars and
-        # treat the slices as separate notes for the next pass.
+        # treat the slices as separate notes for the next pass. This
+        # always makes progress — slices are guaranteed ≤ notes_budget.
         big = groups[0][0]
         slices = [big[i : i + notes_budget] for i in range(0, len(big), notes_budget)]
         groups = [[s] for s in slices]
@@ -484,10 +510,7 @@ def _hierarchical_combine(
     })
 
     sub_summaries: list[str] = []
-    for i, group in enumerate(groups, start=1):
-        sub_stage = f"{stage}.group{i}/{len(groups)}"
-        # Recurse one level deeper on each group; each call gets a fresh
-        # depth budget so we don't run out at the leaves.
+    for group in groups:
         sub = _hierarchical_combine(
             group, client=client, cache=cache, on_progress=on_progress,
             budget=budget, depth=depth + 1, max_depth=max_depth,
@@ -495,10 +518,8 @@ def _hierarchical_combine(
         sub_summaries.append(sub)
 
     if len(sub_summaries) == 1:
-        # Already collapsed to a single piece — return it directly.
         return sub_summaries[0]
 
-    # Combine the sub-summaries into the final answer (recursive).
     return _hierarchical_combine(
         sub_summaries, client=client, cache=cache, on_progress=on_progress,
         budget=budget, depth=depth + 1, max_depth=max_depth,
