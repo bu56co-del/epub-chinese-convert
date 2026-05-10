@@ -282,12 +282,24 @@ def test_update_runs_pip_and_touches_init_when_changed(
     assert init_path.stat().st_mtime > before_mtime
 
 
-def test_summarize_endpoint(
+def _parse_sse_events(body: str) -> list[dict]:
+    """Yield JSON objects from a `data: {...}\\n\\n` stream."""
+    out: list[dict] = []
+    for chunk in body.split("\n\n"):
+        line = chunk.strip()
+        if not line.startswith("data:"):
+            continue
+        out.append(json.loads(line[5:].strip()))
+    return out
+
+
+def test_summarize_endpoint_streams_progress_then_done(
     client: TestClient,
     skill_epub: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mock LLMClient so we don't hit the network."""
+    """The endpoint emits SSE events; the final one is `done` with the
+    summary text."""
     from epubconv import summarize as sm
 
     class FakeClient:
@@ -305,24 +317,38 @@ def test_summarize_endpoint(
             data={"provider": "banana2556", "model": "gpt-5", "max_chars": "5000"},
         )
     assert r.status_code == 200
-    payload = r.json()
-    assert "一句話總結" in payload["text"]
-    assert payload["chapters_used"] >= 1
-    assert payload["chars_used"] > 0
+    assert "text/event-stream" in r.headers["content-type"]
+
+    events = _parse_sse_events(r.text)
+    stages = [e["stage"] for e in events]
+    assert stages[0] == "extracting"
+    assert "extracted" in stages
+    assert "batch_start" in stages
+    assert "batch_done" in stages
+    assert stages[-1] == "done"
+    final = events[-1]
+    assert "一句話總結" in final["text"]
+    assert final["chapters_used"] >= 1
+    assert final["chars_used"] > 0
 
 
 def test_summarize_endpoint_handles_empty_book(
     client: TestClient,
     sample_epub: Path,
 ) -> None:
-    # Conftest sample is too short → summarize raises ValueError → 400.
+    # Conftest sample is too short → summarize raises ValueError → emitted
+    # as a final SSE error event with status=400.
     with sample_epub.open("rb") as fh:
         r = client.post(
             "/summarize",
             files={"file": ("sample.epub", fh, "application/epub+zip")},
             data={"max_chars": "5000"},
         )
-    assert r.status_code == 400
+    assert r.status_code == 200
+    events = _parse_sse_events(r.text)
+    final = events[-1]
+    assert final["stage"] == "error"
+    assert final["status"] == 400
 
 
 def test_summarize_endpoint_passes_per_call_budget_through(
@@ -358,14 +384,13 @@ def test_summary_form_has_per_call_budget_input(client: TestClient) -> None:
     assert "Per-call budget" in text
 
 
-def test_summarize_endpoint_returns_502_with_batch_context_on_upstream_failure(
+def test_summarize_endpoint_emits_error_event_with_batch_context(
     client: TestClient,
     skill_epub: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the LLM upstream rejects the request, /summarize returns 502
-    with a detail string naming the stage and char count so the user can
-    see what to tweak."""
+    """SummaryError surfaces as a final SSE event with status=502 and the
+    detail string naming the stage and char count."""
     from epubconv import summarize as sm
 
     def boom(*a, **kw):
@@ -380,11 +405,14 @@ def test_summarize_endpoint_returns_502_with_batch_context_on_upstream_failure(
             "/summarize",
             files={"file": ("novel.epub", fh, "application/epub+zip")},
         )
-    assert r.status_code == 502
-    detail = r.json()["detail"]
-    assert "batch-3/14" in detail
-    assert "49823" in detail
-    assert "Input too long" in detail
+    assert r.status_code == 200
+    events = _parse_sse_events(r.text)
+    final = events[-1]
+    assert final["stage"] == "error"
+    assert final["status"] == 502
+    assert "batch-3/14" in final["detail"]
+    assert "49823" in final["detail"]
+    assert "Input too long" in final["detail"]
 
 
 def test_no_server_side_settings_endpoints(client: TestClient) -> None:

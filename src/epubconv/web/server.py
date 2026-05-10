@@ -12,12 +12,14 @@ Optional dependency: install with ``pip install epubconv[web]``.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -25,7 +27,7 @@ from urllib.request import Request, urlopen
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "fastapi is required. Install with: pip install epubconv[web]"
@@ -107,6 +109,10 @@ INDEX_HTML = """<!DOCTYPE html>
   .missing { color: var(--error); }
   #update-status { font-size: 0.85em; color: var(--text-muted); }
   ::selection { background: var(--accent); color: #0f172a; }
+  progress { -webkit-appearance: none; appearance: none; border: 0; }
+  progress::-webkit-progress-bar { background: var(--bg); border-radius: 4px; }
+  progress::-webkit-progress-value { background: var(--accent); border-radius: 4px; transition: width 0.2s; }
+  progress::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -210,6 +216,10 @@ INDEX_HTML = """<!DOCTYPE html>
     separately, then merged. Lower the budget if you see "Single message too long" / "Input too long"
     upstream errors; raise it on long-context models to use fewer calls.</p>
   <button type="button" id="btn-summary">Generate summary</button>
+  <div id="summary-progress" style="display:none">
+    <progress id="summary-bar" value="0" max="100" style="width:100%; height:0.6em"></progress>
+    <div id="summary-progress-text" class="muted" style="font-family:monospace; font-size:0.85em"></div>
+  </div>
   <div id="summary-status" class="muted"></div>
   <div id="summary-out" class="summary-md" style="display:none"></div>
 </form>
@@ -353,39 +363,112 @@ INDEX_HTML = """<!DOCTYPE html>
     );
   });
 
-  // -------- Summary --------
+  // -------- Summary (SSE-streamed progress) --------
   const summaryForm = document.getElementById("f-summary");
   const summaryStatus = document.getElementById("summary-status");
   const summaryOut = document.getElementById("summary-out");
+  const summaryProgress = document.getElementById("summary-progress");
+  const summaryBar = document.getElementById("summary-bar");
+  const summaryProgressText = document.getElementById("summary-progress-text");
+
+  function fmt(n) { return n.toLocaleString(); }
+
+  function handleSummaryEvent(ev) {
+    const total = ev.chars_total || 0;
+    const done = ev.chars_processed || 0;
+    const pct = total > 0 ? Math.min(99, Math.round((done * 100) / total)) : 0;
+
+    if (ev.stage === "extracting") {
+      summaryProgressText.textContent = "Reading EPUB…";
+    } else if (ev.stage === "extracted") {
+      summaryProgressText.textContent =
+        `Found ${ev.chapters} chapters, ${fmt(total)} chars to process.`;
+    } else if (ev.stage === "batch_start") {
+      summaryBar.value = pct;
+      summaryProgressText.textContent =
+        `Batch ${ev.batch_no} (budget ${fmt(ev.budget)} chars, sending ${fmt(ev.batch_chars)})… ${pct}%`;
+    } else if (ev.stage === "batch_done") {
+      summaryBar.value = pct;
+      const sec = (ev.elapsed_ms / 1000).toFixed(1);
+      summaryProgressText.textContent =
+        `Batch ${ev.batch_no} ok (${sec}s) — ${fmt(done)}/${fmt(total)} (${pct}%)`;
+    } else if (ev.stage === "halve") {
+      summaryProgressText.textContent =
+        `Upstream "too long" — halving budget ${fmt(ev.old_budget)}→${fmt(ev.new_budget)} and retrying…`;
+    } else if (ev.stage === "combine_start") {
+      summaryBar.value = 99;
+      summaryProgressText.textContent =
+        `All batches done. Combining ${fmt(ev.notes_chars)} chars of notes into final summary…`;
+    } else if (ev.stage === "combine_done") {
+      summaryBar.value = 100;
+    } else if (ev.stage === "done") {
+      summaryBar.value = 100;
+      summaryStatus.textContent =
+        `Summarised ${ev.chapters_used} chapters (${fmt(ev.chars_used)} chars).`;
+      summaryOut.style.display = "block";
+      summaryOut.innerHTML = simpleMarkdown(ev.text);
+    } else if (ev.stage === "error") {
+      let msg = "Error: " + ev.detail;
+      if (typeof ev.detail === "string") {
+        if (ev.detail.includes("API key")) {
+          msg += " — open the Settings tab and paste your key.";
+        } else if (/too long|context|max_tokens/i.test(ev.detail)) {
+          msg += " — try lowering Per-call budget (e.g. halve it) and resubmit.";
+        }
+      }
+      summaryStatus.textContent = msg;
+      summaryProgress.style.display = "none";
+    }
+  }
+
   document.getElementById("btn-summary").addEventListener("click", async () => {
-    summaryStatus.textContent = "Reading EPUB and querying the LLM (this can take 30-60s)…";
+    summaryStatus.textContent = "";
     summaryOut.style.display = "none";
+    summaryProgress.style.display = "block";
+    summaryBar.value = 0;
+    summaryProgressText.textContent = "Starting…";
 
     const fd = new FormData(summaryForm);
-    // Pick the right localStorage key for the chosen provider and add to form.
     const provider = fd.get("provider");
     const keyName = provider === "gemini" ? "GEMINI_API_KEY" : "BANANA2556_API_KEY";
     const stored = getKey(keyName);
     if (stored) fd.set("api_key", stored);
 
-    const r = await fetch("/summarize", { method: "POST", body: fd });
-    const data = await r.json().catch(() => null);
-    if (!r.ok) {
-      const detail = data ? data.detail : r.statusText;
-      summaryStatus.textContent = "Error: " + detail;
-      const detailStr = typeof detail === "string" ? detail : "";
-      if (detailStr.includes("API key")) {
-        summaryStatus.textContent += " — open the Settings tab and paste your key.";
-      } else if (/too long|context|max_tokens/i.test(detailStr)) {
-        summaryStatus.textContent +=
-          " — try lowering the Per-call budget (e.g. halve it) and resubmit.";
-      }
+    let r;
+    try {
+      r = await fetch("/summarize", { method: "POST", body: fd });
+    } catch (e) {
+      summaryStatus.textContent = "Network error: " + e;
+      summaryProgress.style.display = "none";
       return;
     }
-    summaryStatus.textContent =
-      `Summarised ${data.chapters_used} chapters (${data.chars_used.toLocaleString()} chars).`;
-    summaryOut.style.display = "block";
-    summaryOut.innerHTML = simpleMarkdown(data.text);
+    if (!r.ok) {
+      const fallback = await r.text();
+      summaryStatus.textContent = "Error " + r.status + ": " + fallback.slice(0, 240);
+      summaryProgress.style.display = "none";
+      return;
+    }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let parts = buf.split("\\n\\n");
+      buf = parts.pop();
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        try {
+          const ev = JSON.parse(line.slice(5).trim());
+          handleSummaryEvent(ev);
+        } catch (e) {
+          console.warn("bad SSE event:", line, e);
+        }
+      }
+    }
   });
 
   // -------- Settings (localStorage only) --------
@@ -768,7 +851,15 @@ def create_app() -> FastAPI:
         max_chars: int = Form(800_000),
         per_call_budget: int = Form(20_000),
         api_key: str = Form(""),
-    ) -> JSONResponse:
+    ) -> StreamingResponse:
+        """Stream Server-Sent Events with stage-by-stage progress.
+
+        Each event is one ``data: <json>\\n\\n`` block. Stages: extracting /
+        extracted / batch_start / batch_done / halve / combine_start /
+        combine_done / done / error. The browser builds a progress bar
+        from the chars_processed / chars_total fields without us having
+        to know the batch count up front (it changes on every halve).
+        """
         upload_name = file.filename or "input.epub"
         tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-summary-"))
         src = tmp_dir / upload_name
@@ -778,29 +869,55 @@ def create_app() -> FastAPI:
             name=upload_name, provider=provider, model=model or "<default>",
             mc=max_chars, pb=per_call_budget,
         )
-        try:
-            result = summarise_epub(
-                src,
-                max_chars=max_chars,
-                per_call_budget=per_call_budget,
-                provider=provider,
-                model=model or None,
-                api_key=api_key or None,
-            )
-        except ValueError as exc:
-            logger.warning("summarize endpoint: 400 {exc}", exc=exc)
-            raise HTTPException(status_code=400, detail=str(exc))
-        except SummaryError as exc:
-            logger.error("summarize endpoint: {exc}", exc=exc)
-            raise HTTPException(status_code=502, detail=str(exc))
-        except Exception as exc:
-            logger.exception("summarize endpoint: unexpected error")
-            raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
-        return JSONResponse({
-            "text": result.text,
-            "chars_used": result.chars_used,
-            "chapters_used": result.chapters_used,
-        })
+
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue = asyncio.Queue()
+        END = object()
+
+        def on_progress(stage: str, data) -> None:
+            """Called from the worker thread; bridges into the asyncio loop."""
+            asyncio.run_coroutine_threadsafe(events.put({"stage": stage, **dict(data)}), loop)
+
+        def worker() -> None:
+            try:
+                result = summarise_epub(
+                    src,
+                    max_chars=max_chars,
+                    per_call_budget=per_call_budget,
+                    provider=provider,
+                    model=model or None,
+                    api_key=api_key or None,
+                    progress=on_progress,
+                )
+                on_progress("done", {
+                    "text": result.text,
+                    "chars_used": result.chars_used,
+                    "chapters_used": result.chapters_used,
+                })
+            except ValueError as exc:
+                logger.warning("summarize endpoint: 400 {exc}", exc=exc)
+                on_progress("error", {"status": 400, "detail": str(exc)})
+            except SummaryError as exc:
+                logger.error("summarize endpoint: 502 {exc}", exc=exc)
+                on_progress("error", {"status": 502, "detail": str(exc)})
+            except Exception as exc:
+                logger.exception("summarize endpoint: unexpected error")
+                on_progress("error", {"status": 500, "detail": f"{type(exc).__name__}: {exc}"})
+            finally:
+                asyncio.run_coroutine_threadsafe(events.put(END), loop)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        async def event_stream():
+            while True:
+                event = await events.get()
+                if event is END:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event.get("stage") in ("done", "error"):
+                    break
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     return app
 

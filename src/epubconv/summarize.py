@@ -20,6 +20,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Mapping
 
 from loguru import logger
 
@@ -27,6 +28,21 @@ from .epub import extract_epub
 from .llm.client import LLMClient, LLMConfig
 from .pipeline import _read_text
 from .skill.extract import clean_text, is_content_file, read_toc
+from .summary_cache import SummaryCache, hash_file, hash_text
+
+# Callback signature for progress streaming. Stages we emit:
+#   "extracting"      — about to read the EPUB
+#   "extracted"       — chars_total + chapters fields ready
+#   "batch_start"     — batch_no, budget, batch_chars, chars_processed, chars_total
+#   "batch_done"      — batch_no, batch_chars, elapsed_ms, chars_processed, chars_total
+#   "halve"           — old_budget, new_budget, chars_processed, chars_total
+#   "combine_start"   — chars_processed, chars_total
+#   "combine_done"    — elapsed_ms
+ProgressFn = Callable[[str, Mapping[str, object]], None]
+
+
+def _noop_progress(_stage: str, _data: Mapping[str, object]) -> None:
+    pass
 
 DEFAULT_MAX_CHARS = 800_000  # large; relies on long-context models like Haiku 4.5
 DEFAULT_PROVIDER = "banana2556"
@@ -193,15 +209,36 @@ def summarise_epub(
     api_key: str | None = None,
     client: LLMClient | None = None,
     per_call_budget: int = _PER_CALL_CHAR_BUDGET,
+    progress: ProgressFn | None = None,
+    cache: SummaryCache | None = None,
 ) -> Summary:
-    """Top-level entry: extract → (chunk if long) → ask LLM → return :class:`Summary`."""
+    """Top-level entry: extract → (chunk if long) → ask LLM → return :class:`Summary`.
+
+    ``progress`` is an optional callback ``progress(stage, data)`` invoked at
+    each stage so the web UI can stream a progress bar.
+
+    ``cache`` is an optional :class:`SummaryCache` that stores partial
+    results to disk keyed by content hash. After a partial failure
+    (e.g. combine step too long) a re-run with the same EPUB will reuse
+    every successful batch instead of paying for another round trip.
+    Defaults to a per-book cache under
+    ``$EPUBCONV_CONFIG_DIR/cache/summary/<book_sha>/``.
+    """
+    on_progress = progress or _noop_progress
+    on_progress("extracting", {})
     body, chapters = book_text(epub_path, max_chars=max_chars)
     if not body:
         raise ValueError(f"no readable text in {epub_path}")
 
+    on_progress("extracted", {"chars_total": len(body), "chapters": chapters})
+
     if client is None:
         cfg = LLMConfig.for_provider(provider, model=model or DEFAULT_MODEL, api_key=api_key)
         client = LLMClient(cfg)
+
+    if cache is None:
+        cache = SummaryCache(hash_file(epub_path))
+    logger.info("summarise: cache root {root}", root=cache.root)
 
     logger.info(
         "summarise: book has {chars} chars across {chapters} chapters (budget per call: {budget})",
@@ -210,15 +247,63 @@ def summarise_epub(
 
     if len(body) <= per_call_budget:
         logger.info("summarise: single-call path (body fits in one request)")
+        on_progress("batch_start", {
+            "batch_no": 1, "budget": per_call_budget, "batch_chars": len(body),
+            "chars_processed": 0, "chars_total": len(body),
+        })
         prompt = _USER_TEMPLATE.format(max_chars=max_chars, body=body)
-        text = _call(client, "single", _SYSTEM_PROMPT, prompt, batch_chars=len(body))
+        started = time.time()
+        text = _cached_call(
+            client, cache, "single", body,
+            stage_label="single",
+            system=_SYSTEM_PROMPT, user=prompt, batch_chars=len(body),
+        )
+        on_progress("batch_done", {
+            "batch_no": 1, "batch_chars": len(body),
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "chars_processed": len(body), "chars_total": len(body),
+        })
     else:
-        text = _summarise_long(body, client=client, per_call_budget=per_call_budget)
+        text = _summarise_long(
+            body, client=client, per_call_budget=per_call_budget,
+            on_progress=on_progress, cache=cache,
+        )
 
     return Summary(text=text, chars_used=len(body), chapters_used=chapters)
 
 
-def _summarise_long(body: str, *, client: LLMClient, per_call_budget: int) -> str:
+def _cached_call(
+    client: LLMClient,
+    cache: SummaryCache,
+    kind: str,
+    cache_input: str,
+    *,
+    stage_label: str,
+    system: str,
+    user: str,
+    batch_chars: int,
+) -> str:
+    """Look up ``hash_text(cache_input)`` in the cache; on miss, call the
+    LLM and persist the result. ``kind`` is the cache namespace
+    (``"batch"`` / ``"combine"`` / ``"single"``)."""
+    key = hash_text(cache_input)
+    cached = cache.get(kind, key)
+    if cached is not None:
+        logger.info("summarise[{stage}]: cache HIT (key={key})", stage=stage_label, key=key[:8])
+        return cached
+    out = _call(client, stage_label, system, user, batch_chars=batch_chars)
+    cache.set(kind, key, out)
+    return out
+
+
+def _summarise_long(
+    body: str,
+    *,
+    client: LLMClient,
+    per_call_budget: int,
+    on_progress: ProgressFn = _noop_progress,
+    cache: SummaryCache,
+) -> str:
     """Map-reduce with adaptive batch sizing.
 
     The proxy / model behind a banana2556 alias often caps per-message
@@ -242,6 +327,8 @@ def _summarise_long(body: str, *, client: LLMClient, per_call_budget: int) -> st
     current_budget = per_call_budget
     min_budget = _MIN_BATCH_BUDGET
     batch_no = 0
+    chars_total = len(body)
+    chars_processed = 0
 
     logger.info(
         "summarise: map-reduce starting at budget {budget} chars (body {n} chars)",
@@ -255,8 +342,17 @@ def _summarise_long(body: str, *, client: LLMClient, per_call_budget: int) -> st
         batch_no += 1
         stage = f"batch-{batch_no}@{current_budget}"
         prompt = _CHUNK_TEMPLATE.format(body=first_batch)
+        on_progress("batch_start", {
+            "batch_no": batch_no, "budget": current_budget, "batch_chars": len(first_batch),
+            "chars_processed": chars_processed, "chars_total": chars_total,
+        })
+        started = time.time()
         try:
-            out = _call(client, stage, _SYSTEM_PROMPT, prompt, batch_chars=len(first_batch))
+            out = _cached_call(
+                client, cache, "batch", first_batch,
+                stage_label=stage, system=_SYSTEM_PROMPT, user=prompt,
+                batch_chars=len(first_batch),
+            )
         except SummaryError as exc:
             if not _looks_too_long(exc):
                 raise
@@ -271,17 +367,90 @@ def _summarise_long(body: str, *, client: LLMClient, per_call_budget: int) -> st
                 "summarise[{stage}]: 'too long' — halving budget {old}→{new} and retrying same region",
                 stage=stage, old=current_budget, new=new_budget,
             )
+            on_progress("halve", {
+                "old_budget": current_budget, "new_budget": new_budget,
+                "chars_processed": chars_processed, "chars_total": chars_total,
+            })
             current_budget = new_budget
             batch_no -= 1  # don't count the failed attempt
             continue
 
+        chars_processed += len(first_batch)
+        on_progress("batch_done", {
+            "batch_no": batch_no, "batch_chars": len(first_batch),
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "chars_processed": chars_processed, "chars_total": chars_total,
+        })
         notes.append(f"## 段 {len(notes) + 1}\n\n{out}")
         # Advance past the consumed batch (preserve a clean delimiter).
         body_remaining = body_remaining[len(first_batch):].lstrip("\n")
 
     merged = "\n\n".join(notes)
-    final_prompt = _COMBINE_TEMPLATE.format(notes=merged)
-    return _call(client, "combine", _SYSTEM_PROMPT, final_prompt, batch_chars=len(merged))
+    on_progress("combine_start", {
+        "chars_processed": chars_processed, "chars_total": chars_total,
+        "notes_chars": len(merged),
+    })
+    started = time.time()
+    out = _hierarchical_combine(
+        notes, client=client, cache=cache, on_progress=on_progress,
+        budget=current_budget,
+    )
+    on_progress("combine_done", {"elapsed_ms": int((time.time() - started) * 1000)})
+    return out
+
+
+def _hierarchical_combine(
+    notes: list[str],
+    *,
+    client: LLMClient,
+    cache: SummaryCache,
+    on_progress: ProgressFn,
+    budget: int,
+    depth: int = 0,
+    max_depth: int = 4,
+) -> str:
+    """Combine batch notes into the structured summary, splitting if too big.
+
+    A 40-batch book yields ~250K chars of notes — typically too big for a
+    single combine call on a tight proxy. We try once; if the upstream
+    rejects with "too long" we split the notes in half on ``## 段``
+    boundaries, combine each half into a sub-summary, then combine those.
+    Recursion depth capped to keep runaway costs in check.
+    """
+    merged = "\n\n".join(notes)
+    stage = f"combine@d{depth}"
+    prompt = _COMBINE_TEMPLATE.format(notes=merged)
+    try:
+        return _cached_call(
+            client, cache, "combine", merged,
+            stage_label=stage, system=_SYSTEM_PROMPT, user=prompt,
+            batch_chars=len(merged),
+        )
+    except SummaryError as exc:
+        if not _looks_too_long(exc) or depth >= max_depth or len(notes) <= 1:
+            raise
+        new_budget = budget // 2 if budget else 0
+        logger.warning(
+            "summarise[combine@d{d}]: 'too long' with {n} notes ({chars} chars) — bisecting "
+            "and recursing (depth limit {max})",
+            d=depth, n=len(notes), chars=len(merged), max=max_depth,
+        )
+        on_progress("combine_split", {
+            "depth": depth, "notes_in": len(notes), "notes_chars": len(merged),
+        })
+        half = max(1, len(notes) // 2)
+        left = _hierarchical_combine(
+            notes[:half], client=client, cache=cache, on_progress=on_progress,
+            budget=new_budget, depth=depth + 1, max_depth=max_depth,
+        )
+        right = _hierarchical_combine(
+            notes[half:], client=client, cache=cache, on_progress=on_progress,
+            budget=new_budget, depth=depth + 1, max_depth=max_depth,
+        )
+        return _hierarchical_combine(
+            [left, right], client=client, cache=cache, on_progress=on_progress,
+            budget=new_budget, depth=depth + 1, max_depth=max_depth,
+        )
 
 
 _TOO_LONG_MARKERS = (

@@ -8,6 +8,13 @@ import pytest
 from epubconv import summarize
 
 
+@pytest.fixture(autouse=True)
+def isolated_cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test gets a private SummaryCache root via EPUBCONV_CONFIG_DIR
+    so cached results never leak across tests."""
+    monkeypatch.setenv("EPUBCONV_CONFIG_DIR", str(tmp_path / "epubconv-cfg"))
+
+
 def _build_book(tmp_path: Path) -> Path:
     container = (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -312,6 +319,204 @@ def test_adaptive_does_not_kick_in_for_other_errors(tmp_path: Path) -> None:
         )
     # Exactly one call — no halving retry.
     assert calls["n"] == 1
+
+
+# ---- progress callback ----
+
+
+def test_progress_callback_emits_expected_stages_short_book(tmp_path: Path) -> None:
+    """Single-call path should emit extracting → extracted → batch_start →
+    batch_done; the last stage isn't `done` because that's emitted at the
+    /summarize endpoint level, not by summarise_epub."""
+    epub = _build_book(tmp_path)
+    events: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            return "## 一句話總結\n短"
+
+    summarize.summarise_epub(
+        epub, max_chars=10_000, client=FakeClient(), per_call_budget=999_999,
+        progress=lambda stage, data: events.append((stage, dict(data))),
+    )
+    stages = [s for s, _ in events]
+    assert stages == ["extracting", "extracted", "batch_start", "batch_done"]
+    extracted = events[1][1]
+    assert extracted["chars_total"] > 0
+    assert extracted["chapters"] >= 1
+
+
+def test_progress_callback_emits_halve_event_on_too_long(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    epub = _build_book(tmp_path)
+    events: list[tuple[str, dict]] = []
+
+    class HalveOnce:
+        def __init__(self) -> None:
+            self.first = True
+        def complete(self, system: str, user: str, **kw) -> str:
+            if self.first:
+                self.first = False
+                raise RuntimeError("Upstream error: Single message too long")
+            if "請整合" in user:
+                return "## 一句話總結\n合"
+            return "### 內容\n- ok"
+
+    summarize.summarise_epub(
+        epub, max_chars=10_000, client=HalveOnce(), per_call_budget=400,
+        progress=lambda stage, data: events.append((stage, dict(data))),
+    )
+    stages = [s for s, _ in events]
+    assert "halve" in stages
+    halve = next(d for s, d in events if s == "halve")
+    assert halve["old_budget"] == 400
+    assert halve["new_budget"] == 200
+
+
+# ---- disk cache + hierarchical combine ----
+
+
+def test_cache_short_circuits_repeated_calls(tmp_path: Path) -> None:
+    """Second run on the same book reuses every cached batch + combine."""
+    epub = _build_book(tmp_path)
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.n = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.n += 1
+            if "請整合" in user:
+                return "## 一句話總結\n合"
+            return "### 內容\n- ok"
+
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    c1 = CountingClient()
+    summarize.summarise_epub(
+        epub, max_chars=10_000, client=c1, per_call_budget=200, cache=cache,
+    )
+    first_run_calls = c1.n
+    assert first_run_calls > 0
+
+    c2 = CountingClient()
+    summarize.summarise_epub(
+        epub, max_chars=10_000, client=c2, per_call_budget=200, cache=cache,
+    )
+    # Second run hits cache for every call.
+    assert c2.n == 0
+    # Files persisted on disk.
+    assert any(p.suffix == ".txt" for p in (tmp_path / "cache" / "b").iterdir())
+
+
+def test_cache_partial_progress_resumed(tmp_path: Path) -> None:
+    """If batches 1-3 succeed and combine fails, retrying with the same
+    cache should NOT re-issue batch 1-3 calls."""
+    epub = _build_book(tmp_path)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    class CombineFails:
+        def __init__(self) -> None:
+            self.batch_calls = 0
+            self.combine_calls = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            if "請整合" in user:
+                self.combine_calls += 1
+                raise RuntimeError("Upstream error: Input too long")
+            self.batch_calls += 1
+            return "### 內容\n- ok"
+
+    c1 = CombineFails()
+    with pytest.raises(summarize.SummaryError):
+        summarize.summarise_epub(
+            epub, max_chars=10_000, client=c1, per_call_budget=200, cache=cache,
+        )
+    initial_batch_calls = c1.batch_calls
+    assert initial_batch_calls > 0
+
+    class WorksThisTime:
+        def __init__(self) -> None:
+            self.batch_calls = 0
+            self.combine_calls = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            if "請整合" in user:
+                self.combine_calls += 1
+                return "## 一句話總結\n合"
+            self.batch_calls += 1
+            return "### 內容\n- this should not be called"
+
+    c2 = WorksThisTime()
+    result = summarize.summarise_epub(
+        epub, max_chars=10_000, client=c2, per_call_budget=200, cache=cache,
+    )
+    # All batches were cached → 0 new batch calls; only the combine ran.
+    assert c2.batch_calls == 0
+    assert c2.combine_calls >= 1
+    assert "一句話總結" in result.text
+
+
+def test_hierarchical_combine_bisects_when_too_long(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the combine call hits "too long" we recurse: combine each half
+    of the notes, then combine the sub-summaries."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    epub = _build_book(tmp_path)
+    combine_calls: list[int] = []  # input sizes
+
+    class CombineOnceTooLong:
+        def __init__(self) -> None:
+            self.calls = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.calls += 1
+            if "請整合" in user:
+                combine_calls.append(len(user))
+                # Reject the very first combine attempt (whole notes).
+                if len(combine_calls) == 1:
+                    raise RuntimeError("Upstream error: Input too long")
+                return "## 一句話總結\n合"
+            return "### 內容\n- ok"
+
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+    result = summarize.summarise_epub(
+        epub, max_chars=10_000, client=CombineOnceTooLong(),
+        per_call_budget=200, cache=cache,
+    )
+    # First combine failed (whole), then 2 halves combined, then merged.
+    assert len(combine_calls) >= 3
+    # Each subsequent combine call sends shorter input than the first failure.
+    assert min(combine_calls[1:]) < combine_calls[0]
+    assert "一句話總結" in result.text
+
+
+def test_progress_callback_chars_processed_advances(tmp_path: Path) -> None:
+    epub = _build_book(tmp_path)
+    progress: list[tuple[str, int, int]] = []
+
+    class FakeClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            if "請整合" in user:
+                return "## 一句話總結\n合"
+            return "### 內容\n- ok"
+
+    summarize.summarise_epub(
+        epub, max_chars=10_000, client=FakeClient(), per_call_budget=300,
+        progress=lambda stage, data: progress.append(
+            (stage, data.get("chars_processed", -1), data.get("chars_total", -1))
+        ),
+    )
+    done_events = [(p, t) for s, p, t in progress if s == "batch_done"]
+    assert len(done_events) >= 2
+    # chars_processed must be non-decreasing across batch_done events.
+    processed_values = [p for p, _ in done_events]
+    assert processed_values == sorted(processed_values)
+    # Final batch_done should be at (or within a few chars of) chars_total —
+    # inter-block newline stripping can leave a tiny gap.
+    final_processed, total = done_events[-1]
+    assert total - final_processed <= 4
 
 
 def test_summarise_epub_raises_on_empty_book(tmp_path: Path) -> None:
