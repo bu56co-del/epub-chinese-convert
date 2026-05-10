@@ -43,6 +43,13 @@ _DEFAULTS: dict[str, tuple[str, str, str]] = {
 }
 
 
+def provider_base_url(name: str) -> str:
+    """Return the OpenAI-compatible base URL for a known provider."""
+    if name not in _DEFAULTS:
+        raise ValueError(f"unknown LLM provider: {name!r}; expected one of {PROVIDERS}")
+    return _DEFAULTS[name][0]
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     base_url: str

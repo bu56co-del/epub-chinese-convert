@@ -12,12 +12,16 @@ Optional dependency: install with ``pip install epubconv[web]``.
 """
 from __future__ import annotations
 
+import json
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -32,6 +36,7 @@ from loguru import logger
 from ..converters.writing_mode import WRITING_MODES
 from ..diff import build_diff_report
 from ..engines.registry import get_engine, list_engines
+from ..llm.client import PROVIDERS, provider_base_url
 from ..pipeline import convert_epub
 from ..skill.exporter import export_skill
 from ..summarize import SummaryError, summarise_epub
@@ -232,7 +237,8 @@ INDEX_HTML = """<!DOCTYPE html>
     <button type="button" id="btn-settings-save">Save to browser</button>
     <button type="button" id="btn-settings-clear" class="secondary">Clear stored keys</button>
   </div>
-  <div id="settings-status" class="muted"></div>
+  <button type="button" id="btn-settings-test" class="secondary">Test connection</button>
+  <pre id="settings-status" class="muted result" style="display:none"></pre>
 </form>
 </section>
 
@@ -413,9 +419,9 @@ INDEX_HTML = """<!DOCTYPE html>
       if (value) { setKey(name, value); saved++; }
     }
     for (const inp of settingsForm.querySelectorAll("input[type=password]")) inp.value = "";
-    settingsStatus.textContent = saved
+    showSettings(saved
       ? `Saved ${saved} key${saved === 1 ? "" : "s"} to browser localStorage.`
-      : "Nothing to save (inputs were empty).";
+      : "Nothing to save (inputs were empty).");
     refreshSettings();
   });
 
@@ -423,9 +429,39 @@ INDEX_HTML = """<!DOCTYPE html>
     if (!confirm("Remove all saved API keys from this browser?")) return;
     for (const name of KEY_NAMES) setKey(name, "");
     for (const inp of settingsForm.querySelectorAll("input[type=password]")) inp.value = "";
-    settingsStatus.textContent = "Cleared.";
+    showSettings("Cleared.");
     refreshSettings();
   });
+
+  document.getElementById("btn-settings-test").addEventListener("click", async () => {
+    showSettings("Testing…");
+    const lines = [];
+    for (const name of KEY_NAMES) {
+      const provider = name === "GEMINI_API_KEY" ? "gemini" : "banana2556";
+      const key = getKey(name);
+      if (!key) { lines.push(`${provider}: no key saved — skip`); continue; }
+      const fd = new FormData();
+      fd.append("provider", provider);
+      fd.append("api_key", key);
+      try {
+        const r = await fetch("/test-key", { method: "POST", body: fd });
+        const d = await r.json();
+        if (d.ok) {
+          lines.push(`${provider}: ✓ ${d.message}`);
+        } else {
+          lines.push(`${provider}: ✗ HTTP ${d.status} — ${d.message.slice(0, 240)}`);
+        }
+      } catch (e) {
+        lines.push(`${provider}: ✗ network error: ${e}`);
+      }
+    }
+    showSettings(lines.join("\\n"));
+  });
+
+  function showSettings(text) {
+    settingsStatus.style.display = "block";
+    settingsStatus.textContent = text;
+  }
 
   // initial load
   refreshSettings();
@@ -515,6 +551,38 @@ def _git(*args: str, cwd: Path) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def _check_key(provider: str, api_key: str, *, timeout: float = 15.0) -> dict:
+    """Hit GET <base_url>/models with the given key. Returns a dict that the
+    /test-key endpoint can JSON-encode."""
+    base = provider_base_url(provider).rstrip("/")
+    url = f"{base}/models"
+    req = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "epubconv/test-key",
+            "Accept": "application/json",
+        },
+    )
+    ctx = ssl.create_default_context()
+    try:
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read()
+            payload = json.loads(raw.decode("utf-8"))
+            models = payload.get("data") or payload.get("models") or []
+            return {
+                "ok": True,
+                "status": resp.status,
+                "model_count": len(models) if isinstance(models, list) else 0,
+                "message": f"OK — {len(models) if isinstance(models, list) else '?'} models available",
+            }
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        return {"ok": False, "status": e.code, "model_count": 0, "message": body}
+    except (URLError, OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "status": 0, "model_count": 0, "message": f"{type(e).__name__}: {e}"}
+
+
 def _refresh_dependencies(repo_root: Path) -> str:
     """Run ``pip install -e .[web,llm]`` quietly. Idempotent; ~1-2s when
     nothing changed. Returns a short log line for the response."""
@@ -587,6 +655,22 @@ def create_app() -> FastAPI:
             "stdout": out,
             "pip": pip_log,
         })
+
+    @app.post("/test-key")
+    async def test_key_endpoint(
+        provider: str = Form("banana2556"),
+        api_key: str = Form(...),
+    ) -> JSONResponse:
+        """Hit ``GET <base_url>/models`` with the given key as a quick
+        health probe. The Settings tab calls this to give immediate
+        ✓ / ✗ feedback so the user doesn't have to launch a Summary to
+        find out the key is bad."""
+        if provider not in PROVIDERS:
+            raise HTTPException(status_code=400, detail=f"unknown provider: {provider}")
+        if not api_key.strip():
+            raise HTTPException(status_code=400, detail="api_key is required")
+        result = _check_key(provider, api_key.strip())
+        return JSONResponse(result)
 
     @app.post("/convert")
     async def convert_endpoint(

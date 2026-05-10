@@ -434,6 +434,62 @@ def test_settings_tab_uses_localstorage_in_html(client: TestClient) -> None:
     assert "GEMINI_API_KEY" in text
 
 
+def test_test_key_endpoint_calls_provider_models(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The button hits /test-key, which probes GET <base_url>/models."""
+    from epubconv.web import server as srv
+
+    captured: dict = {}
+
+    def fake_check(provider, api_key, **kwargs):
+        captured["provider"] = provider
+        captured["api_key"] = api_key
+        return {"ok": True, "status": 200, "model_count": 17, "message": "OK — 17 models"}
+
+    monkeypatch.setattr(srv, "_check_key", fake_check)
+    r = client.post("/test-key", data={"provider": "banana2556", "api_key": "sk-xyz"})
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["model_count"] == 17
+    assert captured == {"provider": "banana2556", "api_key": "sk-xyz"}
+
+
+def test_test_key_endpoint_returns_401_detail(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from epubconv.web import server as srv
+    monkeypatch.setattr(
+        srv, "_check_key",
+        lambda p, k, **kw: {"ok": False, "status": 401, "model_count": 0, "message": "auth_unavailable"},
+    )
+    r = client.post("/test-key", data={"provider": "banana2556", "api_key": "sk-bad"})
+    assert r.status_code == 200  # the *probe* succeeded; the *upstream* didn't
+    d = r.json()
+    assert d["ok"] is False
+    assert d["status"] == 401
+    assert "auth_unavailable" in d["message"]
+
+
+def test_test_key_endpoint_rejects_unknown_provider(client: TestClient) -> None:
+    r = client.post("/test-key", data={"provider": "openai", "api_key": "sk-x"})
+    assert r.status_code == 400
+
+
+def test_test_key_endpoint_rejects_blank_key(client: TestClient) -> None:
+    r = client.post("/test-key", data={"provider": "banana2556", "api_key": "   "})
+    assert r.status_code == 400
+
+
+def test_settings_tab_has_test_button(client: TestClient) -> None:
+    text = client.get("/").text
+    assert "Test connection" in text
+    assert "btn-settings-test" in text
+
+
 def test_diff_returns_html(client: TestClient, sample_epub: Path) -> None:
     with sample_epub.open("rb") as fh:
         r = client.post(

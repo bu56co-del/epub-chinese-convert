@@ -214,6 +214,106 @@ def test_single_call_failure_also_wrapped_in_summary_error(
     assert "single" in str(excinfo.value)
 
 
+# ---- adaptive halving ----
+
+
+def test_looks_too_long_recognises_common_messages() -> None:
+    assert summarize._looks_too_long(RuntimeError("Single message too long"))
+    assert summarize._looks_too_long(RuntimeError("Upstream error: Input too long"))
+    assert summarize._looks_too_long(RuntimeError("context_length_exceeded"))
+    assert summarize._looks_too_long(RuntimeError("max_tokens limit hit"))
+    assert not summarize._looks_too_long(RuntimeError("rate limit exceeded"))
+    assert not summarize._looks_too_long(RuntimeError("authentication_error"))
+
+
+def test_long_book_halves_budget_when_upstream_rejects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First call fails with 'too long' → budget halves automatically;
+    subsequent calls succeed at the smaller size, no user intervention."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    epub = _build_book(tmp_path)
+    seen_sizes: list[int] = []
+
+    class HalveOnceClient:
+        """Reject the first oversized message; accept everything after."""
+        def __init__(self) -> None:
+            self.rejected_once = False
+
+        def complete(self, system: str, user: str, **kw) -> str:
+            body_len = len(user)
+            seen_sizes.append(body_len)
+            # Reject the first call regardless of size to force a halving event;
+            # subsequent calls always succeed.
+            if not self.rejected_once:
+                self.rejected_once = True
+                raise RuntimeError("Upstream error: Single message too long")
+            if "請整合" in user:
+                return "## 一句話總結\n合併"
+            return "### 內容\n- ok"
+
+    result = summarize.summarise_epub(
+        epub, max_chars=10_000, client=HalveOnceClient(), per_call_budget=400,
+    )
+    # The second-and-later batches should be smaller than the first attempt.
+    assert seen_sizes[0] > seen_sizes[1]
+    assert result.text.startswith("## 一句話總結")
+
+
+def test_adaptive_floor_eventually_gives_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If upstream rejects every size down to the floor (1500 chars),
+    the original error surfaces instead of looping forever."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 1500)
+    epub = _build_book(tmp_path)
+
+    class AlwaysTooLong:
+        def complete(self, system: str, user: str, **kw) -> str:
+            raise RuntimeError("Upstream error: Single message too long")
+
+    with pytest.raises(summarize.SummaryError):
+        summarize.summarise_epub(
+            epub, max_chars=20_000, client=AlwaysTooLong(), per_call_budget=10_000,
+        )
+
+
+def test_adaptive_floor_eventually_gives_up(tmp_path: Path) -> None:
+    """If upstream rejects every size down to the floor (1500 chars),
+    the original error surfaces instead of looping forever."""
+    epub = _build_book(tmp_path)
+
+    class AlwaysTooLong:
+        def complete(self, system: str, user: str, **kw) -> str:
+            raise RuntimeError("Upstream error: Single message too long")
+
+    with pytest.raises(summarize.SummaryError):
+        summarize.summarise_epub(
+            epub, max_chars=20_000, client=AlwaysTooLong(), per_call_budget=10_000,
+        )
+
+
+def test_adaptive_does_not_kick_in_for_other_errors(tmp_path: Path) -> None:
+    """Auth / rate-limit / random errors should NOT trigger halving — they
+    should bubble up immediately."""
+    epub = _build_book(tmp_path)
+    calls = {"n": 0}
+
+    class AuthError:
+        def complete(self, system: str, user: str, **kw) -> str:
+            calls["n"] += 1
+            raise RuntimeError("authentication_error: token invalidated")
+
+    with pytest.raises(summarize.SummaryError):
+        summarize.summarise_epub(
+            epub, max_chars=20_000, client=AuthError(), per_call_budget=200,
+        )
+    # Exactly one call — no halving retry.
+    assert calls["n"] == 1
+
+
 def test_summarise_epub_raises_on_empty_book(tmp_path: Path) -> None:
     # Build an epub with no chunkable content (only a nav file).
     container = (

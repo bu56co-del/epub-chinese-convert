@@ -37,8 +37,15 @@ DEFAULT_MODEL = "claude-haiku-4.5-as"  # banana2556 alias
 # above ~30K chars even though Claude Haiku 4.5's underlying context is
 # 200K tokens. Different proxies / aliases cap at different points, so
 # the user can override this via the UI / form / function arg if they
-# know their provider's limit.
+# know their provider's limit. The map-reduce path also auto-halves on
+# "too long" errors, so this is just the *starting* budget.
 _PER_CALL_CHAR_BUDGET = 20_000
+
+# Hard floor for the adaptive halving loop. If the upstream still
+# rejects a request this small, something is genuinely wrong (auth,
+# outage, etc.) and we surface the original error instead of looping.
+# Tests monkey-patch this down so they don't need >1500-char fixtures.
+_MIN_BATCH_BUDGET = 1500
 
 _SYSTEM_PROMPT = (
     "你係一個書籍分析助手。用繁體中文（zh-TW）回答，"
@@ -212,22 +219,84 @@ def summarise_epub(
 
 
 def _summarise_long(body: str, *, client: LLMClient, per_call_budget: int) -> str:
-    """Map-reduce: split body by chapter boundaries, summarise each batch,
-    then combine the partial notes into the final structured summary."""
-    batches = _split_into_batches(body, per_call_budget)
-    sizes = [len(b) for b in batches]
-    logger.info("summarise: map-reduce — {n} batches, sizes {sizes}", n=len(batches), sizes=sizes)
+    """Map-reduce with adaptive batch sizing.
 
+    The proxy / model behind a banana2556 alias often caps per-message
+    size well below the model's nominal context (e.g. claude-haiku-4.5-as
+    rejects ~19K-char messages even though Haiku 4.5's true context is
+    200K tokens). When that happens the user shouldn't have to keep
+    halving the budget by hand — we halve it ourselves, on the fly:
+
+    1. Try the next batch at ``current_budget`` chars.
+    2. On a "too long" / "context" / "max_tokens" error, halve
+       ``current_budget`` and re-try the same body region. Successful
+       batches are kept; we never re-do work.
+    3. Floor at 1500 chars; below that we surface the original error.
+
+    This costs at most one wasted call per halving event (i.e. O(log n)
+    extra calls), not one per batch, and the user only ever sees the
+    fast path once the budget settles.
+    """
     notes: list[str] = []
-    for i, batch in enumerate(batches, start=1):
-        stage = f"batch-{i}/{len(batches)}"
-        prompt = _CHUNK_TEMPLATE.format(body=batch)
-        out = _call(client, stage, _SYSTEM_PROMPT, prompt, batch_chars=len(batch))
-        notes.append(f"## 段 {i}（共 {len(batches)} 段）\n\n{out}")
+    body_remaining = body
+    current_budget = per_call_budget
+    min_budget = _MIN_BATCH_BUDGET
+    batch_no = 0
+
+    logger.info(
+        "summarise: map-reduce starting at budget {budget} chars (body {n} chars)",
+        budget=current_budget, n=len(body),
+    )
+
+    while body_remaining.strip():
+        # Take the *first* batch under the current budget. We don't
+        # pre-split everything because future budgets may shrink.
+        first_batch = _split_into_batches(body_remaining, current_budget)[0]
+        batch_no += 1
+        stage = f"batch-{batch_no}@{current_budget}"
+        prompt = _CHUNK_TEMPLATE.format(body=first_batch)
+        try:
+            out = _call(client, stage, _SYSTEM_PROMPT, prompt, batch_chars=len(first_batch))
+        except SummaryError as exc:
+            if not _looks_too_long(exc):
+                raise
+            new_budget = current_budget // 2
+            if new_budget < min_budget:
+                logger.error(
+                    "summarise: floor reached ({floor} chars), upstream still rejects — giving up",
+                    floor=min_budget,
+                )
+                raise
+            logger.warning(
+                "summarise[{stage}]: 'too long' — halving budget {old}→{new} and retrying same region",
+                stage=stage, old=current_budget, new=new_budget,
+            )
+            current_budget = new_budget
+            batch_no -= 1  # don't count the failed attempt
+            continue
+
+        notes.append(f"## 段 {len(notes) + 1}\n\n{out}")
+        # Advance past the consumed batch (preserve a clean delimiter).
+        body_remaining = body_remaining[len(first_batch):].lstrip("\n")
 
     merged = "\n\n".join(notes)
     final_prompt = _COMBINE_TEMPLATE.format(notes=merged)
     return _call(client, "combine", _SYSTEM_PROMPT, final_prompt, batch_chars=len(merged))
+
+
+_TOO_LONG_MARKERS = (
+    "too long", "context", "max_tokens", "context_length",
+    "single message too long", "input too long",
+)
+
+
+def _looks_too_long(exc: BaseException) -> bool:
+    """Return True if the wrapped error looks like a per-message size limit."""
+    msg = str(exc).lower()
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        msg += " " + str(cause).lower()
+    return any(marker in msg for marker in _TOO_LONG_MARKERS)
 
 
 def _call(client: LLMClient, stage: str, system: str, user: str, *, batch_chars: int) -> str:
