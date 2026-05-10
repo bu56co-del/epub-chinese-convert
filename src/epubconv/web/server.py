@@ -38,31 +38,66 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta charset="utf-8"/>
 <title>epubconv</title>
 <style>
+  :root {
+    --bg: #0f172a;
+    --bg-raised: #1e293b;
+    --bg-hover: #334155;
+    --border: #334155;
+    --text: #e2e8f0;
+    --text-muted: #94a3b8;
+    --text-strong: #f1f5f9;
+    --accent: #60a5fa;
+    --accent-hover: #93c5fd;
+    --ok: #34d399;
+    --error: #f87171;
+    --code-bg: #0b1120;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--text); }
   body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 1.5em auto; padding: 0 1em; }
+  a { color: var(--accent); }
+  h1, h2, h3 { color: var(--text-strong); }
   h1 { margin-bottom: 0.2em; }
+  code { background: var(--code-bg); padding: 0 0.3em; border-radius: 3px; font-size: 0.9em; }
   header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 0.5em; }
-  .tabs { display: flex; flex-wrap: wrap; gap: 0.25em; border-bottom: 2px solid #ddd; margin-bottom: 1em; }
-  .tab { background: none; border: 0; padding: 0.5em 1em; cursor: pointer; color: #555; border-bottom: 2px solid transparent; margin-bottom: -2px; font-size: 0.95em; }
-  .tab:hover { color: #2563eb; }
-  .tab.active { color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 0.25em; border-bottom: 2px solid var(--border); margin-bottom: 1em; }
+  .tab { background: none; border: 0; padding: 0.5em 1em; cursor: pointer; color: var(--text-muted); border-bottom: 2px solid transparent; margin-bottom: -2px; font-size: 0.95em; }
+  .tab:hover { color: var(--accent-hover); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
   .panel { display: none; }
   .panel.active { display: block; }
-  form { display: grid; gap: 0.75em; padding: 1em; border: 1px solid #ddd; border-radius: 8px; }
-  label { display: grid; gap: 0.25em; font-size: 0.9em; }
-  input[type=file], input[type=text], input[type=password], input[type=number], select, button, textarea { padding: 0.5em; font-size: 1em; font-family: inherit; }
-  button { background: #2563eb; color: white; border: 0; border-radius: 6px; cursor: pointer; }
-  button:hover { background: #1d4ed8; }
-  button.secondary { background: #f3f4f6; color: #111; border: 1px solid #d1d5db; }
-  button.secondary:hover { background: #e5e7eb; }
+  form { display: grid; gap: 0.75em; padding: 1em; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; }
+  label { display: grid; gap: 0.25em; font-size: 0.9em; color: var(--text-muted); }
+  input[type=file], input[type=text], input[type=password], input[type=number], select, button, textarea {
+    padding: 0.5em; font-size: 1em; font-family: inherit; border-radius: 6px;
+  }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--accent);
+  }
+  input[type=file] { color: var(--text); }
+  input[type=file]::file-selector-button {
+    background: var(--bg-hover); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 0.3em 0.7em; cursor: pointer; margin-right: 0.5em;
+  }
+  button { background: var(--accent); color: #0f172a; font-weight: 600; border: 0; cursor: pointer; }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { background: var(--bg-hover); color: var(--text-muted); cursor: not-allowed; }
+  button.secondary { background: var(--bg-hover); color: var(--text); border: 1px solid var(--border); font-weight: 400; }
+  button.secondary:hover { background: var(--border); color: var(--text-strong); }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75em; }
-  .muted { color: #666; font-size: 0.85em; }
-  pre.result { white-space: pre-wrap; background: #f9fafb; padding: 0.75em; border-radius: 6px; max-height: 24em; overflow-y: auto; }
-  .summary-md { background: #f9fafb; padding: 1em; border-radius: 6px; line-height: 1.6; }
-  .summary-md h2 { margin-top: 1em; }
+  .muted { color: var(--text-muted); font-size: 0.85em; }
+  pre.result { white-space: pre-wrap; background: var(--code-bg); color: var(--text); padding: 0.75em; border-radius: 6px; max-height: 24em; overflow-y: auto; border: 1px solid var(--border); }
+  .summary-md { background: var(--bg); color: var(--text); padding: 1em; border-radius: 6px; line-height: 1.6; border: 1px solid var(--border); }
+  .summary-md h2, .summary-md h3 { color: var(--text-strong); margin-top: 1em; }
+  .summary-md code { background: var(--code-bg); }
   .key-status { font-family: monospace; }
-  .ok { color: #070; }
-  .missing { color: #b00; }
-  #update-status { font-size: 0.85em; color: #555; }
+  .ok { color: var(--ok); }
+  .missing { color: var(--error); }
+  #update-status { font-size: 0.85em; color: var(--text-muted); }
+  ::selection { background: var(--accent); color: #0f172a; }
 </style>
 </head>
 <body>
