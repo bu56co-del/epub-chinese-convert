@@ -186,6 +186,166 @@ def test_install_skill_overwrites_existing(
         assert r.status_code == 200
 
 
+def test_index_includes_all_tabs(client: TestClient) -> None:
+    r = client.get("/")
+    text = r.text
+    for label in ["Convert", "Diff", "Export Skill", "Summary", "Image Gen"]:
+        assert f">{label}<" in text or f"data-tab=" in text  # tab buttons
+    assert "btn-update" in text
+
+
+def test_update_endpoint_runs_git_pull(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The endpoint resolves the repo root via Path; we monkey-patch the
+    git wrapper so we don't depend on a live remote."""
+    from epubconv.web import server as srv
+
+    calls: list[tuple] = []
+
+    def fake_git(*args: str, cwd: Path) -> tuple[int, str, str]:
+        calls.append((args, cwd))
+        if args[0] == "pull":
+            return 0, "Already up to date.", ""
+        if args[0] == "rev-parse":
+            return 0, "abc123def4567890", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(srv, "_git", fake_git)
+    r = client.post("/update")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["changed"] is False
+    assert payload["head"] == "abc123def4567890"
+    assert calls and calls[0][0][0] == "pull"
+
+
+def test_update_endpoint_reports_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from epubconv.web import server as srv
+    monkeypatch.setattr(srv, "_git", lambda *args, cwd: (1, "", "fatal: not a git repo"))
+    r = client.post("/update")
+    assert r.status_code == 500
+    assert "fatal" in r.json()["detail"]
+
+
+def test_summarize_endpoint(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock LLMClient so we don't hit the network."""
+    from epubconv import summarize as sm
+
+    class FakeClient:
+        def complete(self, system: str, user: str, **kwargs) -> str:
+            return "## 一句話總結\n測試小說。\n\n## 主要人物\n- 主角"
+
+    monkeypatch.setattr(sm, "LLMClient", lambda cfg: FakeClient())
+    monkeypatch.setattr(sm, "LLMConfig",
+                        type("Cfg", (), {"for_provider": staticmethod(lambda *a, **kw: object())}))
+
+    with skill_epub.open("rb") as fh:
+        r = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"provider": "banana2556", "model": "gpt-5", "max_chars": "5000"},
+        )
+    assert r.status_code == 200
+    payload = r.json()
+    assert "一句話總結" in payload["text"]
+    assert payload["chapters_used"] >= 1
+    assert payload["chars_used"] > 0
+
+
+def test_summarize_endpoint_handles_empty_book(
+    client: TestClient,
+    sample_epub: Path,
+) -> None:
+    # Conftest sample is too short → summarize raises ValueError → 400.
+    with sample_epub.open("rb") as fh:
+        r = client.post(
+            "/summarize",
+            files={"file": ("sample.epub", fh, "application/epub+zip")},
+            data={"max_chars": "5000"},
+        )
+    assert r.status_code == 400
+
+
+def test_generate_image_text_to_image(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test")
+    from epubconv.web import server as srv
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    monkeypatch.setattr(srv, "generate_image", lambda **kw: fake_png)
+
+    r = client.post(
+        "/generate-image",
+        data={"prompt": "a castle", "model": "dall-e-3", "size": "1024x1024"},
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/png"
+    assert r.content == fake_png
+
+
+def test_generate_image_with_reference(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test")
+    from epubconv.web import server as srv
+    captured: dict = {}
+
+    def fake_edit(**kw):
+        captured.update(kw)
+        return b"\x89PNG\r\n\x1a\n" + b"FAKE-EDITED"
+
+    monkeypatch.setattr(srv, "edit_image", fake_edit)
+
+    ref_bytes = b"\x89PNG\r\n\x1a\n" + b"FAKE-REF"
+    r = client.post(
+        "/generate-image",
+        data={"prompt": "same character", "model": "gpt-image-1", "size": "1024x1024"},
+        files={"reference": ("ref.png", ref_bytes, "image/png")},
+    )
+    assert r.status_code == 200
+    assert r.content.endswith(b"FAKE-EDITED")
+    assert captured["reference_image"] == ref_bytes
+    assert captured["model"] == "gpt-image-1"
+
+
+def test_generate_image_missing_key(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BANANA2556_API_KEY", raising=False)
+    r = client.post("/generate-image", data={"prompt": "x", "model": "dall-e-3"})
+    assert r.status_code == 400
+    assert "BANANA2556_API_KEY" in r.json()["detail"]
+
+
+def test_generate_image_upstream_error(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test")
+    from epubconv.web import server as srv
+
+    def boom(**kw):
+        raise RuntimeError("Cloudflare 1010")
+
+    monkeypatch.setattr(srv, "generate_image", boom)
+    r = client.post("/generate-image", data={"prompt": "x", "model": "dall-e-3"})
+    assert r.status_code == 502
+
+
 def test_diff_returns_html(client: TestClient, sample_epub: Path) -> None:
     with sample_epub.open("rb") as fh:
         r = client.post(

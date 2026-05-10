@@ -117,11 +117,28 @@ epubconv convert book.epub --glossary names.yaml
 
 ```bash
 pip install -e ".[web]"
-epubconv serve
+epubconv serve            # add --reload to auto-restart on file changes
 # open http://127.0.0.1:8000
 ```
 
-Drag-drop EPUB, pick variant, get back the converted file or a diff report.
+Or on macOS, double-click **`launch.command`** to start the server and
+auto-open the browser without touching the terminal. (First launch creates
+the venv and installs deps; subsequent launches are instant.)
+
+The web UI has five tabs:
+
+* **Convert** — upload EPUB, pick variant, download converted EPUB
+* **Diff** — side-by-side HTML diff
+* **Export Skill** — Download ZIP / **Install to ~/.claude/skills/** (see
+  the export-skill section above)
+* **Summary** — one-click LLM book summary (主角 / 主題 / 章節摘要),
+  uses banana2556 by default. Requires `BANANA2556_API_KEY`.
+* **Image Gen** — text-to-image and image-to-image (with reference)
+  via banana2556's OpenAI-compatible endpoint. Requires `BANANA2556_API_KEY`.
+
+A small **↻ Update** button in the header runs `git pull --ff-only` from
+the server. Combined with `--reload`, the server hot-restarts after the
+pull, so updating the app is one click.
 
 ---
 

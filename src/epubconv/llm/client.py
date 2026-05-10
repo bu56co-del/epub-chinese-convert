@@ -79,12 +79,19 @@ class LLMClient:
         self._client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
 
     def translate(self, text: str, target_lang: str) -> str:
+        return self.complete(
+            system=SYSTEM_PROMPT,
+            user=f"Target: {target_lang}\n\n{text}",
+        )
+
+    def complete(self, system: str, user: str, *, temperature: float = 0.0) -> str:
+        """Generic chat completion. Returns the assistant message content."""
         resp = self._client.chat.completions.create(
             model=self.cfg.model,
-            temperature=0,
+            temperature=temperature,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Target: {target_lang}\n\n{text}"},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
         )
         choice = resp.choices[0]
