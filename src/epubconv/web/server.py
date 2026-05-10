@@ -195,7 +195,15 @@ INDEX_HTML = """<!DOCTYPE html>
     </select></label>
     <label>Model <input type="text" name="model" value="claude-haiku-4.5-as" placeholder="claude-haiku-4.5-as / gpt-5 / claude-3-5-sonnet-20241022 / gemini-1.5-pro"></label>
   </div>
-  <label>Max source chars <input type="number" name="max_chars" value="800000" min="2000" max="2000000"></label>
+  <div class="row">
+    <label>Max source chars <input type="number" name="max_chars" value="800000" min="2000" max="2000000"></label>
+    <label>Per-call budget (chars)
+      <input type="number" name="per_call_budget" value="20000" min="2000" max="200000">
+    </label>
+  </div>
+  <p class="muted">Long books are split into batches of <em>per-call budget</em> chars, summarised
+    separately, then merged. Lower the budget if you see "Single message too long" / "Input too long"
+    upstream errors; raise it on long-context models to use fewer calls.</p>
   <button type="button" id="btn-summary">Generate summary</button>
   <div id="summary-status" class="muted"></div>
   <div id="summary-out" class="summary-md" style="display:none"></div>
@@ -359,8 +367,12 @@ INDEX_HTML = """<!DOCTYPE html>
     if (!r.ok) {
       const detail = data ? data.detail : r.statusText;
       summaryStatus.textContent = "Error: " + detail;
-      if (typeof detail === "string" && detail.includes("API key")) {
+      const detailStr = typeof detail === "string" ? detail : "";
+      if (detailStr.includes("API key")) {
         summaryStatus.textContent += " — open the Settings tab and paste your key.";
+      } else if (/too long|context|max_tokens/i.test(detailStr)) {
+        summaryStatus.textContent +=
+          " — try lowering the Per-call budget (e.g. halve it) and resubmit.";
       }
       return;
     }
@@ -670,6 +682,7 @@ def create_app() -> FastAPI:
         provider: str = Form("banana2556"),
         model: str = Form(""),
         max_chars: int = Form(800_000),
+        per_call_budget: int = Form(20_000),
         api_key: str = Form(""),
     ) -> JSONResponse:
         upload_name = file.filename or "input.epub"
@@ -677,13 +690,15 @@ def create_app() -> FastAPI:
         src = tmp_dir / upload_name
         src.write_bytes(await file.read())
         logger.info(
-            "summarize endpoint: file={name} provider={provider} model={model} max_chars={mc}",
-            name=upload_name, provider=provider, model=model or "<default>", mc=max_chars,
+            "summarize endpoint: file={name} provider={provider} model={model} max_chars={mc} per_call={pb}",
+            name=upload_name, provider=provider, model=model or "<default>",
+            mc=max_chars, pb=per_call_budget,
         )
         try:
             result = summarise_epub(
                 src,
                 max_chars=max_chars,
+                per_call_budget=per_call_budget,
                 provider=provider,
                 model=model or None,
                 api_key=api_key or None,

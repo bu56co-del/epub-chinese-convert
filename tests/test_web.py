@@ -325,6 +325,39 @@ def test_summarize_endpoint_handles_empty_book(
     assert r.status_code == 400
 
 
+def test_summarize_endpoint_passes_per_call_budget_through(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Per-call budget UI input lets users dodge proxy-specific
+    'Single message too long' caps. The endpoint must pass it through
+    unchanged to summarise_epub."""
+    captured: dict = {}
+    from epubconv.web import server as srv
+
+    def fake_summarise(path, **kwargs):
+        captured.update(kwargs)
+        from epubconv.summarize import Summary
+        return Summary(text="ok", chars_used=1, chapters_used=1)
+
+    monkeypatch.setattr(srv, "summarise_epub", fake_summarise)
+    with skill_epub.open("rb") as fh:
+        r = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"per_call_budget": "8000"},
+        )
+    assert r.status_code == 200
+    assert captured["per_call_budget"] == 8000
+
+
+def test_summary_form_has_per_call_budget_input(client: TestClient) -> None:
+    text = client.get("/").text
+    assert 'name="per_call_budget"' in text
+    assert "Per-call budget" in text
+
+
 def test_summarize_endpoint_returns_502_with_batch_context_on_upstream_failure(
     client: TestClient,
     skill_epub: Path,

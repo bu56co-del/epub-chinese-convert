@@ -33,12 +33,12 @@ DEFAULT_PROVIDER = "banana2556"
 DEFAULT_MODEL = "claude-haiku-4.5-as"  # banana2556 alias
 
 # How many source characters we send in one chat-completions call.
-# Chinese characters tokenise at ~1.5–2 tokens each in Anthropic / OpenAI
-# tokenisers, so 50K chars ≈ 75–100K tokens. Combined with the system
-# prompt + structured output we stay well clear of 200K-token windows
-# (and well clear of providers that cap shorter than that). The trade-off
-# is more API calls per long book; that's why each batch is light.
-_PER_CALL_CHAR_BUDGET = 50_000
+# Empirical floor — banana2556's claude-haiku-4.5-as alias rejects messages
+# above ~30K chars even though Claude Haiku 4.5's underlying context is
+# 200K tokens. Different proxies / aliases cap at different points, so
+# the user can override this via the UI / form / function arg if they
+# know their provider's limit.
+_PER_CALL_CHAR_BUDGET = 20_000
 
 _SYSTEM_PROMPT = (
     "你係一個書籍分析助手。用繁體中文（zh-TW）回答，"
