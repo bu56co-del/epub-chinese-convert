@@ -400,8 +400,12 @@ INDEX_HTML = """<!DOCTYPE html>
       summaryProgressText.textContent =
         `All batches done. Combining ${fmt(ev.notes_chars)} chars of notes into final summary…`;
     } else if (ev.stage === "combine_split") {
+      const groups = ev.groups_out;
+      const groupsLabel = groups ? ` into ${groups} groups` : "";
+      const budgetLabel = ev.budget ? ` (group budget ${fmt(ev.budget)} chars)` : "";
       summaryProgressText.textContent =
-        `Combine too long at depth ${ev.depth} — bisecting ${ev.notes_in} notes (${fmt(ev.notes_chars)} chars)…`;
+        `Combine round ${ev.depth + 1}: ${ev.notes_in} notes (${fmt(ev.notes_chars)} chars) ` +
+        `won't fit in one call — packing${groupsLabel}${budgetLabel}…`;
     } else if (ev.stage === "combine_done") {
       summaryBar.value = 100;
     } else if (ev.stage === "done") {
