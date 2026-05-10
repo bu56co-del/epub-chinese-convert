@@ -279,60 +279,51 @@ def test_summarize_endpoint_handles_empty_book(
     assert r.status_code == 400
 
 
-def test_settings_get_reflects_environment(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test1234")
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    r = client.get("/settings")
-    assert r.status_code == 200
-    data = r.json()
-    assert data["BANANA2556_API_KEY"]["configured"] is True
-    assert data["BANANA2556_API_KEY"]["last4"] == "1234"
-    assert data["GEMINI_API_KEY"]["configured"] is False
+def test_no_server_side_settings_endpoints(client: TestClient) -> None:
+    """API keys live in browser localStorage now; no server endpoints."""
+    assert client.get("/settings").status_code == 404
+    assert client.post("/settings", json={"BANANA2556_API_KEY": "x"}).status_code == 404
+    assert client.post("/settings/reload").status_code == 404
 
 
-def test_settings_post_saves_and_updates_env(
+def test_summarize_accepts_api_key_form_field(
     client: TestClient,
-    tmp_path: Path,
+    skill_epub: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("EPUBCONV_CONFIG_DIR", str(tmp_path))
+    """The browser sends the localStorage key as a form param. The server
+    should pass it through to summarise_epub instead of looking at env."""
     monkeypatch.delenv("BANANA2556_API_KEY", raising=False)
 
-    r = client.post("/settings", json={"BANANA2556_API_KEY": "sk-saved"})
+    captured: dict = {}
+    from epubconv.web import server as srv
+
+    def fake_summarise(path, **kwargs):
+        captured.update(kwargs)
+        from epubconv.summarize import Summary
+        return Summary(text="ok", chars_used=1, chapters_used=1)
+
+    monkeypatch.setattr(srv, "summarise_epub", fake_summarise)
+
+    with skill_epub.open("rb") as fh:
+        r = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"provider": "banana2556", "api_key": "sk-from-browser"},
+        )
     assert r.status_code == 200
-    assert r.json()["BANANA2556_API_KEY"]["last4"] == "aved"
-
-    # File written and key in env.
-    contents = (tmp_path / "secrets.env").read_text(encoding="utf-8")
-    assert "BANANA2556_API_KEY=sk-saved" in contents
-    import os
-    assert os.environ.get("BANANA2556_API_KEY") == "sk-saved"
+    assert captured["api_key"] == "sk-from-browser"
 
 
-def test_settings_post_rejects_unknown_key(client: TestClient) -> None:
-    r = client.post("/settings", json={"FOO_BAR": "x"})
-    assert r.status_code == 400
-    assert "unknown" in r.json()["detail"].lower()
-
-
-def test_settings_reload_endpoint(
-    client: TestClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("EPUBCONV_CONFIG_DIR", str(tmp_path))
-    monkeypatch.delenv("BANANA2556_API_KEY", raising=False)
-    (tmp_path / "secrets.env").write_text(
-        "BANANA2556_API_KEY=sk-reloaded\n", encoding="utf-8",
-    )
-    r = client.post("/settings/reload")
-    assert r.status_code == 200
-    # Subsequent /settings should reflect the loaded value.
-    r2 = client.get("/settings")
-    assert r2.json()["BANANA2556_API_KEY"]["configured"] is True
+def test_settings_tab_uses_localstorage_in_html(client: TestClient) -> None:
+    text = client.get("/").text
+    # The tab still exists, but the JS reads/writes localStorage rather
+    # than calling /settings.
+    assert "Save to browser" in text
+    assert "localStorage" in text
+    assert 'localStorage.setItem("epubconv:"' in text
+    assert "BANANA2556_API_KEY" in text  # appears in KEY_NAMES array
+    assert "GEMINI_API_KEY" in text
 
 
 def test_diff_returns_html(client: TestClient, sample_epub: Path) -> None:

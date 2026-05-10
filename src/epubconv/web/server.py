@@ -28,7 +28,6 @@ from ..converters.writing_mode import WRITING_MODES
 from ..diff import build_diff_report
 from ..engines.registry import get_engine, list_engines
 from ..pipeline import convert_epub
-from ..settings import KNOWN_KEYS, load_into_env, save_keys, status as settings_status
 from ..skill.exporter import export_skill
 from ..summarize import summarise_epub
 
@@ -181,16 +180,17 @@ INDEX_HTML = """<!DOCTYPE html>
 <form id="f-summary" enctype="multipart/form-data">
   <h3>One-click book summary</h3>
   <p class="muted">Sends the book's text through an LLM and returns a structured summary.
-    Set your provider key in the <strong>Settings</strong> tab first.</p>
+    The API key from the <strong>⚙ Settings</strong> tab (browser localStorage) is sent
+    along with each request.</p>
   <label>EPUB <input type="file" name="file" accept=".epub" required></label>
   <div class="row">
     <label>Provider <select name="provider">
       <option value="banana2556">banana2556</option>
       <option value="gemini">gemini</option>
     </select></label>
-    <label>Model <input type="text" name="model" value="gpt-5" placeholder="gpt-5 / gpt-4o / claude-3-5-sonnet-20241022 / gemini-1.5-pro"></label>
+    <label>Model <input type="text" name="model" value="claude-haiku-4.5-as" placeholder="claude-haiku-4.5-as / gpt-5 / claude-3-5-sonnet-20241022 / gemini-1.5-pro"></label>
   </div>
-  <label>Max source chars <input type="number" name="max_chars" value="80000" min="2000" max="500000"></label>
+  <label>Max source chars <input type="number" name="max_chars" value="800000" min="2000" max="2000000"></label>
   <button type="button" id="btn-summary">Generate summary</button>
   <div id="summary-status" class="muted"></div>
   <div id="summary-out" class="summary-md" style="display:none"></div>
@@ -200,9 +200,10 @@ INDEX_HTML = """<!DOCTYPE html>
 <section id="t-settings" class="panel">
 <form id="f-settings">
   <h3>API keys</h3>
-  <p class="muted">Saved to <code>~/.config/epubconv/secrets.env</code> with mode 0600.
-    Loaded into the server's environment at startup so other tabs can use them.
-    A value already exported in your shell takes precedence over what's saved here.</p>
+  <p class="muted">Saved in <strong>your browser's localStorage</strong> only —
+    never written to the server's filesystem. Sent with each request that
+    needs an LLM. A shell-exported env var on the server takes precedence
+    if you also have one set there.</p>
 
   <label>BANANA2556_API_KEY
     <span class="key-status muted" id="status-banana2556">…</span>
@@ -215,8 +216,8 @@ INDEX_HTML = """<!DOCTYPE html>
   </label>
 
   <div class="row">
-    <button type="button" id="btn-settings-save">Save</button>
-    <button type="button" id="btn-settings-reload" class="secondary">Reload from disk</button>
+    <button type="button" id="btn-settings-save">Save to browser</button>
+    <button type="button" id="btn-settings-clear" class="secondary">Clear stored keys</button>
   </div>
   <div id="settings-status" class="muted"></div>
 </form>
@@ -224,6 +225,14 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <script>
 (function() {
+  // -------- Local API-key storage --------
+  const KEY_NAMES = ["BANANA2556_API_KEY", "GEMINI_API_KEY"];
+  function getKey(name) { return localStorage.getItem("epubconv:" + name) || ""; }
+  function setKey(name, value) {
+    if (value) localStorage.setItem("epubconv:" + name, value);
+    else localStorage.removeItem("epubconv:" + name);
+  }
+
   // -------- Tabs --------
   document.querySelectorAll(".tab").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -296,10 +305,22 @@ INDEX_HTML = """<!DOCTYPE html>
   document.getElementById("btn-summary").addEventListener("click", async () => {
     summaryStatus.textContent = "Reading EPUB and querying the LLM (this can take 30-60s)…";
     summaryOut.style.display = "none";
-    const r = await fetch("/summarize", { method: "POST", body: new FormData(summaryForm) });
+
+    const fd = new FormData(summaryForm);
+    // Pick the right localStorage key for the chosen provider and add to form.
+    const provider = fd.get("provider");
+    const keyName = provider === "gemini" ? "GEMINI_API_KEY" : "BANANA2556_API_KEY";
+    const stored = getKey(keyName);
+    if (stored) fd.set("api_key", stored);
+
+    const r = await fetch("/summarize", { method: "POST", body: fd });
     const data = await r.json().catch(() => null);
     if (!r.ok) {
-      summaryStatus.textContent = "Error: " + (data ? data.detail : r.statusText);
+      const detail = data ? data.detail : r.statusText;
+      summaryStatus.textContent = "Error: " + detail;
+      if (typeof detail === "string" && detail.includes("API key")) {
+        summaryStatus.textContent += " — open the Settings tab and paste your key.";
+      }
       return;
     }
     summaryStatus.textContent =
@@ -308,21 +329,21 @@ INDEX_HTML = """<!DOCTYPE html>
     summaryOut.innerHTML = simpleMarkdown(data.text);
   });
 
-  // -------- Settings --------
+  // -------- Settings (localStorage only) --------
   const settingsForm = document.getElementById("f-settings");
   const settingsStatus = document.getElementById("settings-status");
 
-  async function refreshSettings() {
-    const r = await fetch("/settings");
-    if (!r.ok) { settingsStatus.textContent = "Error: " + r.statusText; return; }
-    const data = await r.json();
-    for (const [key, info] of Object.entries(data)) {
-      const span = document.getElementById("status-" + key.toLowerCase().replace(/_api_key$/, ""));
+  function refreshSettings() {
+    for (const name of KEY_NAMES) {
+      const value = getKey(name);
+      const span = document.getElementById(
+        "status-" + name.toLowerCase().replace(/_api_key$/, "")
+      );
       if (!span) continue;
       span.classList.remove("ok", "missing");
-      if (info.configured) {
+      if (value) {
         span.classList.add("ok");
-        span.textContent = `set (••••${info.last4})`;
+        span.textContent = `set (••••${value.slice(-4)})`;
       } else {
         span.classList.add("missing");
         span.textContent = "not set";
@@ -330,35 +351,26 @@ INDEX_HTML = """<!DOCTYPE html>
     }
   }
 
-  document.getElementById("btn-settings-save").addEventListener("click", async () => {
-    settingsStatus.textContent = "Saving…";
+  document.getElementById("btn-settings-save").addEventListener("click", () => {
     const fd = new FormData(settingsForm);
-    // Drop empty fields so blank inputs don't clear an existing key.
-    const payload = {};
-    for (const [k, v] of fd.entries()) {
-      if (typeof v === "string" && v.trim()) payload[k] = v.trim();
+    let saved = 0;
+    for (const name of KEY_NAMES) {
+      const value = (fd.get(name) || "").toString().trim();
+      // Empty input leaves the existing value alone (use Clear to remove).
+      if (value) { setKey(name, value); saved++; }
     }
-    const r = await fetch("/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!r.ok) {
-      const d = await r.json().catch(() => null);
-      settingsStatus.textContent = "Error: " + (d ? d.detail : r.statusText);
-      return;
-    }
-    // Clear input values after save so the masked indicator is the source of truth.
     for (const inp of settingsForm.querySelectorAll("input[type=password]")) inp.value = "";
-    settingsStatus.textContent = "Saved.";
+    settingsStatus.textContent = saved
+      ? `Saved ${saved} key${saved === 1 ? "" : "s"} to browser localStorage.`
+      : "Nothing to save (inputs were empty).";
     refreshSettings();
   });
 
-  document.getElementById("btn-settings-reload").addEventListener("click", async () => {
-    settingsStatus.textContent = "Reloading from disk…";
-    const r = await fetch("/settings/reload", { method: "POST" });
-    if (!r.ok) { settingsStatus.textContent = "Error: " + r.statusText; return; }
-    settingsStatus.textContent = "Reloaded.";
+  document.getElementById("btn-settings-clear").addEventListener("click", () => {
+    if (!confirm("Remove all saved API keys from this browser?")) return;
+    for (const name of KEY_NAMES) setKey(name, "");
+    for (const inp of settingsForm.querySelectorAll("input[type=password]")) inp.value = "";
+    settingsStatus.textContent = "Cleared.";
     refreshSettings();
   });
 
@@ -454,11 +466,6 @@ def create_app() -> FastAPI:
     app = FastAPI(title="epubconv", docs_url=None, redoc_url=None)
     repo_root = Path(__file__).resolve().parents[3]
 
-    # Pull saved API keys into os.environ on startup so /summarize and any
-    # future LLM features can find them without the user re-exporting in
-    # the shell after each --reload.
-    load_into_env()
-
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         opts = "\n".join(f"<option>{name}</option>" for name in list_engines())
@@ -489,25 +496,6 @@ def create_app() -> FastAPI:
             "files": files,
             "stdout": out,
         })
-
-    @app.get("/settings")
-    def settings_get() -> JSONResponse:
-        return JSONResponse(settings_status())
-
-    @app.post("/settings")
-    async def settings_post(payload: dict) -> JSONResponse:
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="payload must be a JSON object")
-        unknown = [k for k in payload if k not in KNOWN_KEYS]
-        if unknown:
-            raise HTTPException(status_code=400, detail=f"unknown keys: {unknown}")
-        save_keys({k: str(v) for k, v in payload.items()})
-        return JSONResponse(settings_status())
-
-    @app.post("/settings/reload")
-    def settings_reload() -> JSONResponse:
-        load_into_env()
-        return JSONResponse(settings_status())
 
     @app.post("/convert")
     async def convert_endpoint(
@@ -602,7 +590,8 @@ def create_app() -> FastAPI:
         file: UploadFile = File(...),
         provider: str = Form("banana2556"),
         model: str = Form(""),
-        max_chars: int = Form(80_000),
+        max_chars: int = Form(800_000),
+        api_key: str = Form(""),
     ) -> JSONResponse:
         upload_name = file.filename or "input.epub"
         tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-summary-"))
@@ -614,6 +603,7 @@ def create_app() -> FastAPI:
                 max_chars=max_chars,
                 provider=provider,
                 model=model or None,
+                api_key=api_key or None,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

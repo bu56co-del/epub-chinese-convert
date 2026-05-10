@@ -19,9 +19,9 @@ from .llm.client import LLMClient, LLMConfig
 from .pipeline import _read_text
 from .skill.extract import clean_text, is_content_file, read_toc
 
-DEFAULT_MAX_CHARS = 80_000  # well under GPT-5 / Gemini 1.5 context budgets
+DEFAULT_MAX_CHARS = 800_000  # large; relies on long-context models like Haiku 4.5
 DEFAULT_PROVIDER = "banana2556"
-DEFAULT_MODEL = "gpt-5"  # banana2556 routes to OpenAI's latest
+DEFAULT_MODEL = "claude-haiku-4.5-as"  # banana2556 alias
 
 _SYSTEM_PROMPT = (
     "你係一個書籍分析助手。用繁體中文（zh-TW）回答，"
