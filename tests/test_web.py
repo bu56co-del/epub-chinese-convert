@@ -325,6 +325,35 @@ def test_summarize_endpoint_handles_empty_book(
     assert r.status_code == 400
 
 
+def test_summarize_endpoint_returns_502_with_batch_context_on_upstream_failure(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the LLM upstream rejects the request, /summarize returns 502
+    with a detail string naming the stage and char count so the user can
+    see what to tweak."""
+    from epubconv import summarize as sm
+
+    def boom(*a, **kw):
+        raise sm.SummaryError(
+            "batch-3/14: LLM rejected 49823 input chars after 12.4s: "
+            "Upstream error: Input too long"
+        )
+
+    monkeypatch.setattr("epubconv.web.server.summarise_epub", boom)
+    with skill_epub.open("rb") as fh:
+        r = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+        )
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert "batch-3/14" in detail
+    assert "49823" in detail
+    assert "Input too long" in detail
+
+
 def test_no_server_side_settings_endpoints(client: TestClient) -> None:
     """API keys live in browser localStorage now; no server endpoints."""
     assert client.get("/settings").status_code == 404

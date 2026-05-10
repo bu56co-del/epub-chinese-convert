@@ -171,6 +171,49 @@ def test_combine_template_produces_structured_sections() -> None:
         assert header in template
 
 
+def test_failure_in_chunk_phase_raises_summary_error_with_batch_context(
+    tmp_path: Path,
+) -> None:
+    epub = _build_book(tmp_path)
+
+    class FailingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.calls += 1
+            if self.calls >= 2:  # fail on the second batch
+                raise RuntimeError("Upstream error: Input too long")
+            return "### 章節事件 / 內容\n- ok"
+
+    with pytest.raises(summarize.SummaryError) as excinfo:
+        summarize.summarise_epub(
+            epub, max_chars=10_000, client=FailingClient(), per_call_budget=200,
+        )
+    msg = str(excinfo.value)
+    # Error names which batch failed and how many chars were sent.
+    assert "batch-2" in msg
+    assert "Input too long" in msg
+    assert "input chars" in msg
+    # __cause__ preserves the upstream exception type for debuggers.
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_single_call_failure_also_wrapped_in_summary_error(
+    tmp_path: Path,
+) -> None:
+    epub = _build_book(tmp_path)
+
+    class FailingClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            raise RuntimeError("Upstream error: Input too long")
+
+    with pytest.raises(summarize.SummaryError) as excinfo:
+        summarize.summarise_epub(
+            epub, max_chars=10_000, client=FailingClient(), per_call_budget=999_999,
+        )
+    assert "single" in str(excinfo.value)
+
+
 def test_summarise_epub_raises_on_empty_book(tmp_path: Path) -> None:
     # Build an epub with no chunkable content (only a nav file).
     container = (

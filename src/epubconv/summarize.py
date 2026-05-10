@@ -16,26 +16,29 @@ work because they both expose chat-completions.
 """
 from __future__ import annotations
 
-import logging
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from loguru import logger
 
 from .epub import extract_epub
 from .llm.client import LLMClient, LLMConfig
 from .pipeline import _read_text
 from .skill.extract import clean_text, is_content_file, read_toc
 
-logger = logging.getLogger(__name__)
-
 DEFAULT_MAX_CHARS = 800_000  # large; relies on long-context models like Haiku 4.5
 DEFAULT_PROVIDER = "banana2556"
 DEFAULT_MODEL = "claude-haiku-4.5-as"  # banana2556 alias
 
 # How many source characters we send in one chat-completions call.
-# 150K chars ≈ 100K-150K tokens for Chinese/English mix — leaves headroom
-# for system prompt + structured output inside a 200K-token window.
-_PER_CALL_CHAR_BUDGET = 150_000
+# Chinese characters tokenise at ~1.5–2 tokens each in Anthropic / OpenAI
+# tokenisers, so 50K chars ≈ 75–100K tokens. Combined with the system
+# prompt + structured output we stay well clear of 200K-token windows
+# (and well clear of providers that cap shorter than that). The trade-off
+# is more API calls per long book; that's why each batch is light.
+_PER_CALL_CHAR_BUDGET = 50_000
 
 _SYSTEM_PROMPT = (
     "你係一個書籍分析助手。用繁體中文（zh-TW）回答，"
@@ -168,6 +171,12 @@ _COMBINE_TEMPLATE = """以下係本書按章節順序拆成幾段嘅筆記。
 """
 
 
+class SummaryError(RuntimeError):
+    """Raised when the LLM fails on a specific stage; ``__cause__`` carries
+    the original exception. The message includes which stage / batch /
+    char count produced the error so the user can see it in the UI."""
+
+
 def summarise_epub(
     epub_path: Path,
     *,
@@ -187,9 +196,15 @@ def summarise_epub(
         cfg = LLMConfig.for_provider(provider, model=model or DEFAULT_MODEL, api_key=api_key)
         client = LLMClient(cfg)
 
+    logger.info(
+        "summarise: book has {chars} chars across {chapters} chapters (budget per call: {budget})",
+        chars=len(body), chapters=chapters, budget=per_call_budget,
+    )
+
     if len(body) <= per_call_budget:
+        logger.info("summarise: single-call path (body fits in one request)")
         prompt = _USER_TEMPLATE.format(max_chars=max_chars, body=body)
-        text = client.complete(system=_SYSTEM_PROMPT, user=prompt)
+        text = _call(client, "single", _SYSTEM_PROMPT, prompt, batch_chars=len(body))
     else:
         text = _summarise_long(body, client=client, per_call_budget=per_call_budget)
 
@@ -200,19 +215,43 @@ def _summarise_long(body: str, *, client: LLMClient, per_call_budget: int) -> st
     """Map-reduce: split body by chapter boundaries, summarise each batch,
     then combine the partial notes into the final structured summary."""
     batches = _split_into_batches(body, per_call_budget)
-    logger.info("summarise: long book — %d batches of ~%d chars each", len(batches), per_call_budget)
+    sizes = [len(b) for b in batches]
+    logger.info("summarise: map-reduce — {n} batches, sizes {sizes}", n=len(batches), sizes=sizes)
 
     notes: list[str] = []
     for i, batch in enumerate(batches, start=1):
-        logger.info("summarise: batch %d/%d (%d chars)", i, len(batches), len(batch))
+        stage = f"batch-{i}/{len(batches)}"
         prompt = _CHUNK_TEMPLATE.format(body=batch)
-        out = client.complete(system=_SYSTEM_PROMPT, user=prompt)
+        out = _call(client, stage, _SYSTEM_PROMPT, prompt, batch_chars=len(batch))
         notes.append(f"## 段 {i}（共 {len(batches)} 段）\n\n{out}")
 
     merged = "\n\n".join(notes)
-    logger.info("summarise: combining %d batches of notes (%d chars total)", len(batches), len(merged))
     final_prompt = _COMBINE_TEMPLATE.format(notes=merged)
-    return client.complete(system=_SYSTEM_PROMPT, user=final_prompt)
+    return _call(client, "combine", _SYSTEM_PROMPT, final_prompt, batch_chars=len(merged))
+
+
+def _call(client: LLMClient, stage: str, system: str, user: str, *, batch_chars: int) -> str:
+    """Wrap an LLM call with timing + a SummaryError that names the stage
+    and char count when the upstream request fails."""
+    started = time.time()
+    logger.info("summarise[{stage}]: sending {chars} chars", stage=stage, chars=batch_chars)
+    try:
+        out = client.complete(system=system, user=user)
+    except Exception as exc:
+        elapsed = time.time() - started
+        logger.error(
+            "summarise[{stage}]: failed after {sec:.1f}s with {chars} input chars: {exc}",
+            stage=stage, sec=elapsed, chars=batch_chars, exc=exc,
+        )
+        raise SummaryError(
+            f"{stage}: LLM rejected {batch_chars} input chars after {elapsed:.1f}s: {exc}"
+        ) from exc
+    elapsed = time.time() - started
+    logger.info(
+        "summarise[{stage}]: ok in {sec:.1f}s, response {out_chars} chars",
+        stage=stage, sec=elapsed, out_chars=len(out),
+    )
+    return out
 
 
 def _split_into_batches(body: str, budget: int) -> list[str]:

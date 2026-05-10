@@ -27,12 +27,14 @@ except ImportError as exc:  # pragma: no cover
         "fastapi is required. Install with: pip install epubconv[web]"
     ) from exc
 
+from loguru import logger
+
 from ..converters.writing_mode import WRITING_MODES
 from ..diff import build_diff_report
 from ..engines.registry import get_engine, list_engines
 from ..pipeline import convert_epub
 from ..skill.exporter import export_skill
-from ..summarize import summarise_epub
+from ..summarize import SummaryError, summarise_epub
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -674,6 +676,10 @@ def create_app() -> FastAPI:
         tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-summary-"))
         src = tmp_dir / upload_name
         src.write_bytes(await file.read())
+        logger.info(
+            "summarize endpoint: file={name} provider={provider} model={model} max_chars={mc}",
+            name=upload_name, provider=provider, model=model or "<default>", mc=max_chars,
+        )
         try:
             result = summarise_epub(
                 src,
@@ -683,8 +689,13 @@ def create_app() -> FastAPI:
                 api_key=api_key or None,
             )
         except ValueError as exc:
+            logger.warning("summarize endpoint: 400 {exc}", exc=exc)
             raise HTTPException(status_code=400, detail=str(exc))
+        except SummaryError as exc:
+            logger.error("summarize endpoint: {exc}", exc=exc)
+            raise HTTPException(status_code=502, detail=str(exc))
         except Exception as exc:
+            logger.exception("summarize endpoint: unexpected error")
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
         return JSONResponse({
             "text": result.text,
