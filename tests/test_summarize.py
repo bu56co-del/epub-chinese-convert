@@ -492,6 +492,78 @@ def test_hierarchical_combine_bisects_when_too_long(
     assert "一句話總結" in result.text
 
 
+def test_pack_notes_under_budget_packs_greedily() -> None:
+    notes = ["x" * 60, "y" * 60, "z" * 60, "w" * 60]
+    groups = summarize._pack_notes_under_budget(notes, budget=130)
+    # 60 + 2 + 60 = 122 fits; adding 60 + 2 = 184 doesn't. So 2-2 split.
+    assert [len(g) for g in groups] == [2, 2]
+
+
+def test_pack_notes_oversize_note_in_own_group() -> None:
+    notes = ["small", "x" * 1000, "small2"]
+    groups = summarize._pack_notes_under_budget(notes, budget=200)
+    # Big one ends up alone (caller will hard-split it).
+    assert any(len(g) == 1 and len(g[0]) > 200 for g in groups)
+
+
+def test_combine_proactively_splits_large_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even *without* an upstream rejection, the combine should split
+    when joined notes exceed the budget reservation."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    epub = _build_book(tmp_path)
+    sizes_seen: list[int] = []
+
+    class SizeCheckingClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            if "請整合" in user:
+                sizes_seen.append(len(user))
+                return "## 一句話總結\n合"
+            return "### 內容\n- " + ("ok " * 200)  # ~800-char chunk note
+
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+    summarize.summarise_epub(
+        epub, max_chars=10_000, client=SizeCheckingClient(),
+        per_call_budget=400, cache=cache,
+    )
+    # Every combine call sent ≤ budget — never the giant join.
+    notes_budget = int(400 * summarize._COMBINE_PAYLOAD_RATIO)
+    template_padding = len(summarize._COMBINE_TEMPLATE)
+    assert all(s <= notes_budget + template_padding + 200 for s in sizes_seen), sizes_seen
+
+
+def test_combine_handles_oversize_single_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a single sub-summary is bigger than the per-call budget the combine
+    must hard-split its text rather than failing on the recursion."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    big_note = "X" * 5000
+    on_progress_calls: list[tuple[str, dict]] = []
+
+    class OkClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            return "OK"
+
+    out = summarize._hierarchical_combine(
+        [big_note],
+        client=OkClient(),
+        cache=cache,
+        on_progress=lambda s, d: on_progress_calls.append((s, dict(d))),
+        budget=1000,  # hard budget: notes_budget = 700
+        depth=0,
+        max_depth=10,
+    )
+    assert out == "OK"
+    splits = [d for s, d in on_progress_calls if s == "combine_split"]
+    assert splits, "expected at least one combine_split event"
+
+
 def test_progress_callback_chars_processed_advances(tmp_path: Path) -> None:
     epub = _build_book(tmp_path)
     progress: list[tuple[str, int, int]] = []
