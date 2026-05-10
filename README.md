@@ -132,9 +132,12 @@ The web UI has five tabs:
 * **Export Skill** — Download ZIP / **Install to ~/.claude/skills/** (see
   the export-skill section above)
 * **Summary** — one-click LLM book summary (主角 / 主題 / 章節摘要),
-  uses banana2556 by default. Requires `BANANA2556_API_KEY`.
-* **Image Gen** — text-to-image and image-to-image (with reference)
-  via banana2556's OpenAI-compatible endpoint. Requires `BANANA2556_API_KEY`.
+  uses banana2556 by default. Set the API key in the Settings tab.
+* **⚙ Settings** — store provider API keys
+  (`BANANA2556_API_KEY`, `GEMINI_API_KEY`) without touching the shell.
+  Saved to `~/.config/epubconv/secrets.env` (mode `0600`) and loaded
+  into the server's environment on startup. A value already exported in
+  your shell takes precedence.
 
 A small **↻ Update** button in the header runs `git pull --ff-only` from
 the server. Combined with `--reload`, the server hot-restarts after the

@@ -1,16 +1,15 @@
-"""FastAPI server for browser-based EPUB conversion + skill export + summary + image gen.
+"""FastAPI server for browser-based EPUB conversion + skill export + summary.
 
 Runs locally; no auth, no persistence. Designed to be opened by
 double-clicking ``launch.command`` (which runs ``epubconv serve --reload``).
 
-Tabs: Convert / Diff / Skill / Summary / Image. A header "Update" button
-runs ``git pull`` and (with --reload) auto-restarts the server.
+Tabs: Convert / Diff / Skill / Summary / Settings. A header "Update"
+button runs ``git pull`` and (with --reload) auto-restarts the server.
 
 Optional dependency: install with ``pip install epubconv[web]``.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import tempfile
@@ -19,7 +18,7 @@ from pathlib import Path
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "fastapi is required. Install with: pip install epubconv[web]"
@@ -28,8 +27,8 @@ except ImportError as exc:  # pragma: no cover
 from ..converters.writing_mode import WRITING_MODES
 from ..diff import build_diff_report
 from ..engines.registry import get_engine, list_engines
-from ..image.client import edit_image, generate_image
 from ..pipeline import convert_epub
+from ..settings import KNOWN_KEYS, load_into_env, save_keys, status as settings_status
 from ..skill.exporter import export_skill
 from ..summarize import summarise_epub
 
@@ -50,8 +49,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .panel.active { display: block; }
   form { display: grid; gap: 0.75em; padding: 1em; border: 1px solid #ddd; border-radius: 8px; }
   label { display: grid; gap: 0.25em; font-size: 0.9em; }
-  input[type=file], input[type=text], input[type=number], select, button, textarea { padding: 0.5em; font-size: 1em; font-family: inherit; }
-  textarea { resize: vertical; min-height: 4em; }
+  input[type=file], input[type=text], input[type=password], input[type=number], select, button, textarea { padding: 0.5em; font-size: 1em; font-family: inherit; }
   button { background: #2563eb; color: white; border: 0; border-radius: 6px; cursor: pointer; }
   button:hover { background: #1d4ed8; }
   button.secondary { background: #f3f4f6; color: #111; border: 1px solid #d1d5db; }
@@ -61,9 +59,10 @@ INDEX_HTML = """<!DOCTYPE html>
   pre.result { white-space: pre-wrap; background: #f9fafb; padding: 0.75em; border-radius: 6px; max-height: 24em; overflow-y: auto; }
   .summary-md { background: #f9fafb; padding: 1em; border-radius: 6px; line-height: 1.6; }
   .summary-md h2 { margin-top: 1em; }
-  img.output { max-width: 100%; border-radius: 6px; border: 1px solid #ddd; }
+  .key-status { font-family: monospace; }
+  .ok { color: #070; }
+  .missing { color: #b00; }
   #update-status { font-size: 0.85em; color: #555; }
-  .ref-thumb { max-width: 120px; max-height: 120px; border-radius: 4px; border: 1px solid #ddd; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -80,7 +79,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <button class="tab" data-tab="diff">Diff</button>
   <button class="tab" data-tab="skill">Export Skill</button>
   <button class="tab" data-tab="summary">Summary</button>
-  <button class="tab" data-tab="image">Image Gen</button>
+  <button class="tab" data-tab="settings">⚙ Settings</button>
 </div>
 
 <section id="t-convert" class="panel active">
@@ -146,8 +145,8 @@ INDEX_HTML = """<!DOCTYPE html>
 <section id="t-summary" class="panel">
 <form id="f-summary" enctype="multipart/form-data">
   <h3>One-click book summary</h3>
-  <p class="muted">Sends the book's text through an LLM (banana2556) and returns a structured summary.
-    Requires <code>BANANA2556_API_KEY</code> in the environment.</p>
+  <p class="muted">Sends the book's text through an LLM and returns a structured summary.
+    Set your provider key in the <strong>Settings</strong> tab first.</p>
   <label>EPUB <input type="file" name="file" accept=".epub" required></label>
   <div class="row">
     <label>Provider <select name="provider">
@@ -163,44 +162,28 @@ INDEX_HTML = """<!DOCTYPE html>
 </form>
 </section>
 
-<section id="t-image" class="panel">
-<form id="f-image" enctype="multipart/form-data">
-  <h3>Image generation (banana2556)</h3>
-  <p class="muted">Text-to-image, or image-to-image when you provide a reference.
-    Requires <code>BANANA2556_API_KEY</code>.</p>
-  <label>Reference image (optional — triggers image-to-image)
-    <input type="file" name="reference" accept="image/*" id="img-ref">
+<section id="t-settings" class="panel">
+<form id="f-settings">
+  <h3>API keys</h3>
+  <p class="muted">Saved to <code>~/.config/epubconv/secrets.env</code> with mode 0600.
+    Loaded into the server's environment at startup so other tabs can use them.
+    A value already exported in your shell takes precedence over what's saved here.</p>
+
+  <label>BANANA2556_API_KEY
+    <span class="key-status muted" id="status-banana2556">…</span>
+    <input type="password" name="BANANA2556_API_KEY" placeholder="sk-...">
   </label>
-  <div id="img-ref-preview" style="display:none">Ref: <img id="img-ref-thumb" class="ref-thumb" alt=""></div>
-  <label>Prompt
-    <textarea name="prompt" placeholder="A retro pixel-art castle on a hill, sunset" required></textarea>
+
+  <label>GEMINI_API_KEY
+    <span class="key-status muted" id="status-gemini">…</span>
+    <input type="password" name="GEMINI_API_KEY" placeholder="AIza...">
   </label>
+
   <div class="row">
-    <label>Model <select name="model" id="img-model">
-      <option value="dall-e-3">dall-e-3 (text-to-image only)</option>
-      <option value="gpt-image-1">gpt-image-1 (supports refs)</option>
-      <option value="flux-kontext">flux-kontext (supports refs)</option>
-    </select></label>
-    <label>Size <select name="size">
-      <option>1024x1024</option><option>1024x1792</option><option>1792x1024</option>
-      <option>512x512</option>
-    </select></label>
+    <button type="button" id="btn-settings-save">Save</button>
+    <button type="button" id="btn-settings-reload" class="secondary">Reload from disk</button>
   </div>
-  <div class="row">
-    <label>Quality (dall-e-3) <select name="quality">
-      <option>standard</option><option>hd</option>
-    </select></label>
-    <label>Output filename <input type="text" name="filename" value="image.png"></label>
-  </div>
-  <button type="button" id="btn-image">Generate image</button>
-  <div id="img-status" class="muted"></div>
-  <div id="img-output" style="display:none">
-    <img id="img-output-tag" class="output" alt="generated image"/>
-    <div style="margin-top:0.5em">
-      <button type="button" id="btn-img-download" class="secondary">Download</button>
-      <button type="button" id="btn-img-use-as-ref" class="secondary">Use as reference</button>
-    </div>
-  </div>
+  <div id="settings-status" class="muted"></div>
 </form>
 </section>
 
@@ -213,10 +196,11 @@ INDEX_HTML = """<!DOCTYPE html>
       document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById("t-" + btn.dataset.tab).classList.add("active");
+      if (btn.dataset.tab === "settings") refreshSettings();
     });
   });
 
-  // -------- Update (git pull) --------
+  // -------- Update --------
   const updateBtn = document.getElementById("btn-update");
   const updateStatus = document.getElementById("update-status");
   updateBtn.addEventListener("click", async () => {
@@ -225,14 +209,10 @@ INDEX_HTML = """<!DOCTYPE html>
     try {
       const r = await fetch("/update", { method: "POST" });
       const data = await r.json();
-      if (!r.ok) {
-        updateStatus.textContent = "Error: " + (data.detail || r.statusText);
-        return;
-      }
-      const summary = data.changed
-        ? `Updated to ${data.head.slice(0, 7)} (${data.files} files). Server reloading…`
+      if (!r.ok) { updateStatus.textContent = "Error: " + (data.detail || r.statusText); return; }
+      updateStatus.textContent = data.changed
+        ? `Updated to ${data.head.slice(0,7)} (${data.files} files). Server reloading…`
         : "Already up to date.";
-      updateStatus.textContent = summary;
     } catch (e) {
       updateStatus.textContent = "Error: " + e;
     } finally {
@@ -240,7 +220,7 @@ INDEX_HTML = """<!DOCTYPE html>
     }
   });
 
-  // -------- Skill (download / install) --------
+  // -------- Skill --------
   const skillForm = document.getElementById("f-skill");
   const skillResult = document.getElementById("skill-result");
   function showSkill(text, isErr) {
@@ -293,62 +273,64 @@ INDEX_HTML = """<!DOCTYPE html>
     summaryOut.innerHTML = simpleMarkdown(data.text);
   });
 
-  // -------- Image gen --------
-  const imageForm = document.getElementById("f-image");
-  const imgStatus = document.getElementById("img-status");
-  const imgOutput = document.getElementById("img-output");
-  const imgOutputTag = document.getElementById("img-output-tag");
-  const imgRefInput = document.getElementById("img-ref");
-  const imgRefPreview = document.getElementById("img-ref-preview");
-  const imgRefThumb = document.getElementById("img-ref-thumb");
-  const imgModel = document.getElementById("img-model");
-  let lastBlob = null;
+  // -------- Settings --------
+  const settingsForm = document.getElementById("f-settings");
+  const settingsStatus = document.getElementById("settings-status");
 
-  imgRefInput.addEventListener("change", () => {
-    const f = imgRefInput.files[0];
-    if (!f) { imgRefPreview.style.display = "none"; return; }
-    imgRefThumb.src = URL.createObjectURL(f);
-    imgRefPreview.style.display = "block";
-    // If model is dall-e-3 (no ref support) and a ref is provided, hint switch.
-    if (imgModel.value === "dall-e-3") {
-      imgModel.value = "gpt-image-1";
+  async function refreshSettings() {
+    const r = await fetch("/settings");
+    if (!r.ok) { settingsStatus.textContent = "Error: " + r.statusText; return; }
+    const data = await r.json();
+    for (const [key, info] of Object.entries(data)) {
+      const span = document.getElementById("status-" + key.toLowerCase().replace(/_api_key$/, ""));
+      if (!span) continue;
+      span.classList.remove("ok", "missing");
+      if (info.configured) {
+        span.classList.add("ok");
+        span.textContent = `set (••••${info.last4})`;
+      } else {
+        span.classList.add("missing");
+        span.textContent = "not set";
+      }
     }
-  });
+  }
 
-  document.getElementById("btn-image").addEventListener("click", async () => {
-    imgStatus.textContent = "Generating image (can take 20-60s)…";
-    imgOutput.style.display = "none";
-    const r = await fetch("/generate-image", { method: "POST", body: new FormData(imageForm) });
+  document.getElementById("btn-settings-save").addEventListener("click", async () => {
+    settingsStatus.textContent = "Saving…";
+    const fd = new FormData(settingsForm);
+    // Drop empty fields so blank inputs don't clear an existing key.
+    const payload = {};
+    for (const [k, v] of fd.entries()) {
+      if (typeof v === "string" && v.trim()) payload[k] = v.trim();
+    }
+    const r = await fetch("/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
     if (!r.ok) {
-      const data = await r.json().catch(() => null);
-      imgStatus.textContent = "Error: " + (data ? data.detail : r.statusText);
+      const d = await r.json().catch(() => null);
+      settingsStatus.textContent = "Error: " + (d ? d.detail : r.statusText);
       return;
     }
-    lastBlob = await r.blob();
-    imgOutputTag.src = URL.createObjectURL(lastBlob);
-    imgOutput.style.display = "block";
-    imgStatus.textContent = `Generated (${(lastBlob.size / 1024).toFixed(0)} KB).`;
+    // Clear input values after save so the masked indicator is the source of truth.
+    for (const inp of settingsForm.querySelectorAll("input[type=password]")) inp.value = "";
+    settingsStatus.textContent = "Saved.";
+    refreshSettings();
   });
 
-  document.getElementById("btn-img-download").addEventListener("click", () => {
-    if (!lastBlob) return;
-    const fname = imageForm.elements.filename.value || "image.png";
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(lastBlob);
-    a.download = fname; a.click();
+  document.getElementById("btn-settings-reload").addEventListener("click", async () => {
+    settingsStatus.textContent = "Reloading from disk…";
+    const r = await fetch("/settings/reload", { method: "POST" });
+    if (!r.ok) { settingsStatus.textContent = "Error: " + r.statusText; return; }
+    settingsStatus.textContent = "Reloaded.";
+    refreshSettings();
   });
 
-  document.getElementById("btn-img-use-as-ref").addEventListener("click", () => {
-    if (!lastBlob) return;
-    const file = new File([lastBlob], "previous.png", { type: "image/png" });
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    imgRefInput.files = dt.files;
-    imgRefInput.dispatchEvent(new Event("change"));
-    imgStatus.textContent = "Loaded previous output as reference. Edit the prompt and regenerate.";
-  });
+  // initial load
+  refreshSettings();
 
-  // Tiny inline markdown renderer (h2, h3, bold, em, code, lists, paragraphs).
+  // -------- Tiny inline markdown renderer --------
   function simpleMarkdown(s) {
     function esc(t) { return t.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c])); }
     const lines = s.split(/\\r?\\n/);
@@ -437,6 +419,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="epubconv", docs_url=None, redoc_url=None)
     repo_root = Path(__file__).resolve().parents[3]
 
+    # Pull saved API keys into os.environ on startup so /summarize and any
+    # future LLM features can find them without the user re-exporting in
+    # the shell after each --reload.
+    load_into_env()
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         opts = "\n".join(f"<option>{name}</option>" for name in list_engines())
@@ -444,20 +431,12 @@ def create_app() -> FastAPI:
 
     @app.post("/update")
     def update_endpoint() -> JSONResponse:
-        """Run `git pull --ff-only` in the repo, return summary.
-
-        With the server launched as ``epubconv serve --reload``, file changes
-        from the pull trigger an automatic restart, so the user never has to
-        touch the terminal. If the repo isn't a git checkout (e.g. installed
-        from a wheel), we surface a 400 with a clear error.
-        """
         if not (repo_root / ".git").exists():
             raise HTTPException(status_code=400, detail=f"{repo_root} is not a git working tree")
         rc, out, err = _git("pull", "--ff-only", cwd=repo_root)
         if rc != 0:
             raise HTTPException(status_code=500, detail=err or out or "git pull failed")
         rc2, head, _ = _git("rev-parse", "HEAD", cwd=repo_root)
-        # Count files changed in the pull, if any.
         changed = "Already up to date." not in out
         files = 0
         if changed:
@@ -475,6 +454,25 @@ def create_app() -> FastAPI:
             "files": files,
             "stdout": out,
         })
+
+    @app.get("/settings")
+    def settings_get() -> JSONResponse:
+        return JSONResponse(settings_status())
+
+    @app.post("/settings")
+    async def settings_post(payload: dict) -> JSONResponse:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="payload must be a JSON object")
+        unknown = [k for k in payload if k not in KNOWN_KEYS]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"unknown keys: {unknown}")
+        save_keys({k: str(v) for k, v in payload.items()})
+        return JSONResponse(settings_status())
+
+    @app.post("/settings/reload")
+    def settings_reload() -> JSONResponse:
+        load_into_env()
+        return JSONResponse(settings_status())
 
     @app.post("/convert")
     async def convert_endpoint(
@@ -591,46 +589,6 @@ def create_app() -> FastAPI:
             "chars_used": result.chars_used,
             "chapters_used": result.chapters_used,
         })
-
-    @app.post("/generate-image")
-    async def generate_image_endpoint(
-        prompt: str = Form(...),
-        model: str = Form("dall-e-3"),
-        size: str = Form("1024x1024"),
-        quality: str = Form("standard"),
-        reference: UploadFile | None = File(None),
-    ) -> Response:
-        api_key = os.environ.get("BANANA2556_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=400, detail="BANANA2556_API_KEY env var not set")
-
-        try:
-            if reference is not None and reference.filename:
-                ref_bytes = await reference.read()
-                if not ref_bytes:
-                    raise ValueError("empty reference image")
-                png = edit_image(
-                    prompt=prompt,
-                    reference_image=ref_bytes,
-                    reference_filename=reference.filename or "reference.png",
-                    api_key=api_key,
-                    model=model,
-                    size=size,
-                )
-            else:
-                png = generate_image(
-                    prompt=prompt,
-                    api_key=api_key,
-                    model=model,
-                    size=size,
-                    quality=quality,
-                )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        return Response(content=png, media_type="image/png")
 
     return app
 

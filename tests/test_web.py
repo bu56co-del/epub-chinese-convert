@@ -189,9 +189,12 @@ def test_install_skill_overwrites_existing(
 def test_index_includes_all_tabs(client: TestClient) -> None:
     r = client.get("/")
     text = r.text
-    for label in ["Convert", "Diff", "Export Skill", "Summary", "Image Gen"]:
-        assert f">{label}<" in text or f"data-tab=" in text  # tab buttons
+    for label in ["Convert", "Diff", "Export Skill", "Summary", "Settings"]:
+        assert label in text
     assert "btn-update" in text
+    # Image gen has been removed.
+    assert "generate-image" not in text
+    assert "Image Gen" not in text
 
 
 def test_update_endpoint_runs_git_pull(
@@ -276,74 +279,60 @@ def test_summarize_endpoint_handles_empty_book(
     assert r.status_code == 400
 
 
-def test_generate_image_text_to_image(
+def test_settings_get_reflects_environment(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test")
-    from epubconv.web import server as srv
-    fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
-    monkeypatch.setattr(srv, "generate_image", lambda **kw: fake_png)
-
-    r = client.post(
-        "/generate-image",
-        data={"prompt": "a castle", "model": "dall-e-3", "size": "1024x1024"},
-    )
+    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test1234")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    r = client.get("/settings")
     assert r.status_code == 200
-    assert r.headers["content-type"] == "image/png"
-    assert r.content == fake_png
+    data = r.json()
+    assert data["BANANA2556_API_KEY"]["configured"] is True
+    assert data["BANANA2556_API_KEY"]["last4"] == "1234"
+    assert data["GEMINI_API_KEY"]["configured"] is False
 
 
-def test_generate_image_with_reference(
+def test_settings_post_saves_and_updates_env(
     client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-) -> None:
-    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test")
-    from epubconv.web import server as srv
-    captured: dict = {}
-
-    def fake_edit(**kw):
-        captured.update(kw)
-        return b"\x89PNG\r\n\x1a\n" + b"FAKE-EDITED"
-
-    monkeypatch.setattr(srv, "edit_image", fake_edit)
-
-    ref_bytes = b"\x89PNG\r\n\x1a\n" + b"FAKE-REF"
-    r = client.post(
-        "/generate-image",
-        data={"prompt": "same character", "model": "gpt-image-1", "size": "1024x1024"},
-        files={"reference": ("ref.png", ref_bytes, "image/png")},
-    )
-    assert r.status_code == 200
-    assert r.content.endswith(b"FAKE-EDITED")
-    assert captured["reference_image"] == ref_bytes
-    assert captured["model"] == "gpt-image-1"
-
-
-def test_generate_image_missing_key(
-    client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("EPUBCONV_CONFIG_DIR", str(tmp_path))
     monkeypatch.delenv("BANANA2556_API_KEY", raising=False)
-    r = client.post("/generate-image", data={"prompt": "x", "model": "dall-e-3"})
+
+    r = client.post("/settings", json={"BANANA2556_API_KEY": "sk-saved"})
+    assert r.status_code == 200
+    assert r.json()["BANANA2556_API_KEY"]["last4"] == "aved"
+
+    # File written and key in env.
+    contents = (tmp_path / "secrets.env").read_text(encoding="utf-8")
+    assert "BANANA2556_API_KEY=sk-saved" in contents
+    import os
+    assert os.environ.get("BANANA2556_API_KEY") == "sk-saved"
+
+
+def test_settings_post_rejects_unknown_key(client: TestClient) -> None:
+    r = client.post("/settings", json={"FOO_BAR": "x"})
     assert r.status_code == 400
-    assert "BANANA2556_API_KEY" in r.json()["detail"]
+    assert "unknown" in r.json()["detail"].lower()
 
 
-def test_generate_image_upstream_error(
+def test_settings_reload_endpoint(
     client: TestClient,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BANANA2556_API_KEY", "sk-test")
-    from epubconv.web import server as srv
-
-    def boom(**kw):
-        raise RuntimeError("Cloudflare 1010")
-
-    monkeypatch.setattr(srv, "generate_image", boom)
-    r = client.post("/generate-image", data={"prompt": "x", "model": "dall-e-3"})
-    assert r.status_code == 502
+    monkeypatch.setenv("EPUBCONV_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("BANANA2556_API_KEY", raising=False)
+    (tmp_path / "secrets.env").write_text(
+        "BANANA2556_API_KEY=sk-reloaded\n", encoding="utf-8",
+    )
+    r = client.post("/settings/reload")
+    assert r.status_code == 200
+    # Subsequent /settings should reflect the loaded value.
+    r2 = client.get("/settings")
+    assert r2.json()["BANANA2556_API_KEY"]["configured"] is True
 
 
 def test_diff_returns_html(client: TestClient, sample_epub: Path) -> None:
