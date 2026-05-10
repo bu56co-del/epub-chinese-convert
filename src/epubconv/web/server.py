@@ -3,8 +3,10 @@
 Runs locally; no auth, no persistence. Designed to be opened by
 double-clicking ``launch.command`` (which runs ``epubconv serve --reload``).
 
-Tabs: Convert / Diff / Skill / Summary / Settings. A header "Update"
-button runs ``git pull`` and (with --reload) auto-restarts the server.
+Tabs: Convert / Diff / Skill / Summary / Settings. A header "Update &
+Relaunch" button runs ``git pull`` + ``pip install`` and triggers the
+``--reload`` watcher to restart the server with the new code; the
+browser tab refreshes itself on completion.
 
 Optional dependency: install with ``pip install epubconv[web]``.
 """
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -103,7 +106,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <header>
   <h1>epubconv</h1>
   <div>
-    <button id="btn-update" class="secondary">↻ Update (git pull)</button>
+    <button id="btn-update" class="secondary">↻ Update &amp; Relaunch</button>
     <span id="update-status"></span>
   </div>
 </header>
@@ -244,22 +247,58 @@ INDEX_HTML = """<!DOCTYPE html>
     });
   });
 
-  // -------- Update --------
+  // -------- Update & Relaunch --------
   const updateBtn = document.getElementById("btn-update");
   const updateStatus = document.getElementById("update-status");
+
+  async function waitForServerBack(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const r = await fetch("/", { cache: "no-store" });
+        if (r.ok) return true;
+      } catch (e) { /* server still restarting */ }
+      await new Promise(res => setTimeout(res, 500));
+    }
+    return false;
+  }
+
   updateBtn.addEventListener("click", async () => {
     updateBtn.disabled = true;
     updateStatus.textContent = "Pulling…";
+    let data;
     try {
       const r = await fetch("/update", { method: "POST" });
-      const data = await r.json();
-      if (!r.ok) { updateStatus.textContent = "Error: " + (data.detail || r.statusText); return; }
-      updateStatus.textContent = data.changed
-        ? `Updated to ${data.head.slice(0,7)} (${data.files} files). Server reloading…`
-        : "Already up to date.";
+      data = await r.json();
+      if (!r.ok) {
+        updateStatus.textContent = "Error: " + (data.detail || r.statusText);
+        updateBtn.disabled = false;
+        return;
+      }
     } catch (e) {
       updateStatus.textContent = "Error: " + e;
-    } finally {
+      updateBtn.disabled = false;
+      return;
+    }
+
+    if (!data.changed) {
+      updateStatus.textContent = "Already up to date.";
+      updateBtn.disabled = false;
+      return;
+    }
+
+    updateStatus.textContent =
+      `Pulled ${data.head.slice(0,7)} (${data.files} files, pip: ${data.pip}). ` +
+      `Restarting server…`;
+    // Give uvicorn time to notice the file change and start the new process.
+    await new Promise(res => setTimeout(res, 1500));
+    const back = await waitForServerBack(20000);
+    if (back) {
+      updateStatus.textContent = "Reloading browser…";
+      location.reload();
+    } else {
+      updateStatus.textContent =
+        "Server didn't come back in 20s — check the terminal and refresh manually.";
       updateBtn.disabled = false;
     }
   });
@@ -462,6 +501,22 @@ def _git(*args: str, cwd: Path) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def _refresh_dependencies(repo_root: Path) -> str:
+    """Run ``pip install -e .[web,llm]`` quietly. Idempotent; ~1-2s when
+    nothing changed. Returns a short log line for the response."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "-e", f"{repo_root}[web,llm]"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if proc.returncode == 0:
+        return "ok"
+    # Don't fail the whole update on pip errors — surface the message but
+    # let the user see the new code is live.
+    return f"pip exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="epubconv", docs_url=None, redoc_url=None)
     repo_root = Path(__file__).resolve().parents[3]
@@ -473,6 +528,15 @@ def create_app() -> FastAPI:
 
     @app.post("/update")
     def update_endpoint() -> JSONResponse:
+        """Pull latest code, refresh deps, and trigger a reload.
+
+        With ``epubconv serve --reload`` (which ``launch.command`` always
+        uses), uvicorn watches the source tree and restarts on file
+        changes. The browser polls / and refreshes itself when it comes
+        back. We also re-run ``pip install -e ".[web,llm]"`` so a pull
+        that adds an optional dep doesn't leave the server importing a
+        missing package on next request.
+        """
         if not (repo_root / ".git").exists():
             raise HTTPException(status_code=400, detail=f"{repo_root} is not a git working tree")
         rc, out, err = _git("pull", "--ff-only", cwd=repo_root)
@@ -490,11 +554,24 @@ def create_app() -> FastAPI:
                         files = int(parts[0])
                     except (ValueError, IndexError):
                         pass
+
+        pip_log = ""
+        if changed:
+            pip_log = _refresh_dependencies(repo_root)
+
+        # Touching a watched file forces uvicorn's reloader to restart even
+        # if the pull only changed templates / static assets it doesn't
+        # naturally watch. (When code under src/epubconv/ changed, this is
+        # redundant but harmless.)
+        if changed:
+            (repo_root / "src" / "epubconv" / "__init__.py").touch()
+
         return JSONResponse({
             "changed": changed,
             "head": head if rc2 == 0 else "",
             "files": files,
             "stdout": out,
+            "pip": pip_log,
         })
 
     @app.post("/convert")

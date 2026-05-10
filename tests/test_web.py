@@ -236,6 +236,52 @@ def test_update_endpoint_reports_failure(
     assert "fatal" in r.json()["detail"]
 
 
+def test_update_runs_pip_and_touches_init_when_changed(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the pull moves HEAD we install deps and touch __init__.py
+    so uvicorn --reload notices and restarts."""
+    from epubconv.web import server as srv
+
+    pull_output = (
+        "Updating abc1234..def5678\n"
+        "Fast-forward\n"
+        " 3 files changed, 10 insertions(+)\n"
+    )
+
+    def fake_git(*args, cwd):
+        if args[0] == "pull":
+            return 0, pull_output, ""
+        if args[0] == "rev-parse":
+            return 0, "def567890abcdef", ""
+        return 0, "", ""
+
+    pip_calls: list = []
+    def fake_refresh(repo_root):
+        pip_calls.append(repo_root)
+        return "ok"
+
+    init_path = srv.Path(__file__).resolve().parents[1] / "src" / "epubconv" / "__init__.py"
+    init_path.touch()  # ensure exists
+    before_mtime = init_path.stat().st_mtime
+
+    monkeypatch.setattr(srv, "_git", fake_git)
+    monkeypatch.setattr(srv, "_refresh_dependencies", fake_refresh)
+
+    import time as _t
+    _t.sleep(0.01)  # ensure mtime can change
+
+    r = client.post("/update")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["changed"] is True
+    assert payload["files"] == 3
+    assert payload["pip"] == "ok"
+    assert pip_calls == [srv.Path(__file__).resolve().parents[1]]
+    assert init_path.stat().st_mtime > before_mtime
+
+
 def test_summarize_endpoint(
     client: TestClient,
     skill_epub: Path,
