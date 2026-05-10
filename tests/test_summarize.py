@@ -83,6 +83,94 @@ def test_summarise_epub_calls_llm_with_truncated_text(
     assert "繁體中文" in seen["system"]
 
 
+def test_user_template_asks_for_per_chapter_takeaways() -> None:
+    """Each chapter must yield >= 3 takeaway bullets — verify the prompt
+    actually requests this so a regression to the older template is caught."""
+    template = summarize._USER_TEMPLATE
+    assert "啟發" in template or "得著" in template
+    assert "最少 3" in template or "至少 3" in template
+    assert "每章" in template
+
+
+# ---- map-reduce path ----
+
+
+def test_split_into_batches_packs_chapters_under_budget() -> None:
+    body = "## A\n" + "x" * 60 + "\n\n## B\n" + "y" * 60 + "\n\n## C\n" + "z" * 60
+    batches = summarize._split_into_batches(body, budget=140)
+    # Each batch holds at most 2 chapters of length ~63 chars.
+    assert all(len(b) <= 140 for b in batches)
+    # All chapter headings preserved.
+    full = "\n".join(batches)
+    for h in ("## A", "## B", "## C"):
+        assert h in full
+
+
+def test_split_into_batches_hard_splits_oversize_chapter() -> None:
+    body = "## big\n" + ("x" * 1000)
+    batches = summarize._split_into_batches(body, budget=300)
+    assert len(batches) >= 4
+    assert all(len(b) <= 300 for b in batches)
+
+
+def test_short_book_uses_single_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    epub = _build_book(tmp_path)
+    calls = {"n": 0, "user": []}
+
+    class FakeClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            calls["n"] += 1
+            calls["user"].append(user)
+            return "## 一句話總結\n短書"
+
+    summarize.summarise_epub(epub, max_chars=2000, client=FakeClient(), per_call_budget=10_000)
+    assert calls["n"] == 1
+    assert "請按以下結構撮要" in calls["user"][0]
+
+
+def test_long_book_takes_map_reduce_path(
+    tmp_path: Path,
+) -> None:
+    epub = _build_book(tmp_path)
+    calls = {"prompts": []}
+
+    class FakeClient:
+        def complete(self, system: str, user: str, **kw) -> str:
+            calls["prompts"].append(user)
+            if "請整合" in user:
+                return "## 一句話總結\n合併版"
+            return "### 章節事件 / 內容\n- 段落筆記"
+
+    # per_call_budget tiny enough that the (small) test book triggers map-reduce.
+    result = summarize.summarise_epub(
+        epub, max_chars=10_000, client=FakeClient(), per_call_budget=200,
+    )
+    # Expect: N chunk calls + 1 combine call.
+    assert len(calls["prompts"]) >= 2
+    # First few prompts use the chunk template.
+    assert any("唔好寫總結" in p for p in calls["prompts"][:-1])
+    # Final prompt is the combine template.
+    assert "請整合" in calls["prompts"][-1]
+    assert result.text.startswith("## 一句話總結")
+
+
+def test_chunk_template_asks_for_per_chapter_takeaways() -> None:
+    """Per-chunk extraction must also collect takeaways so the combine
+    step has material to merge into the final structured summary."""
+    template = summarize._CHUNK_TEMPLATE
+    assert "啟發" in template or "得著" in template
+    assert "最少 3" in template or "至少 3" in template
+
+
+def test_combine_template_produces_structured_sections() -> None:
+    template = summarize._COMBINE_TEMPLATE
+    for header in ("一句話總結", "主要人物", "主要主題", "章節摘要", "啟發", "寫作風格"):
+        assert header in template
+
+
 def test_summarise_epub_raises_on_empty_book(tmp_path: Path) -> None:
     # Build an epub with no chunkable content (only a nav file).
     container = (
