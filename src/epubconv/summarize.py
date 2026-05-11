@@ -406,6 +406,13 @@ def _summarise_long(
 # the per_call_budget UI input is 20K — keep the reservation conservative.
 _COMBINE_PAYLOAD_RATIO = 0.5
 
+# Hard ceiling on combine payload size *regardless* of per_call_budget.
+# Observed proxy behaviour: banana2556 rejected ~16700 chars / ~22800
+# chars on claude-haiku-4.5-as. We never send more than this many chars
+# of notes content into a single combine call so the call always fits
+# inside the proxy's per-message cap (~13K post-template-wrap).
+_COMBINE_MAX_PAYLOAD = 6000
+
 
 def _hierarchical_combine(
     notes: list[str],
@@ -437,7 +444,12 @@ def _hierarchical_combine(
     condition is "budget below ``_MIN_BATCH_BUDGET``" — at that point
     nothing the model can accept.
     """
-    notes_budget = max(1, int(budget * _COMBINE_PAYLOAD_RATIO))
+    # Two caps:
+    #  - budget * ratio  : leave room for template + output relative to the
+    #                       UI's per-call budget
+    #  - _COMBINE_MAX_PAYLOAD : absolute floor on what banana2556 / claude-
+    #                       haiku-4.5-as can swallow regardless of the UI
+    notes_budget = max(1, min(int(budget * _COMBINE_PAYLOAD_RATIO), _COMBINE_MAX_PAYLOAD))
     merged = "\n\n".join(notes)
     stage = f"combine@d{depth}"
 

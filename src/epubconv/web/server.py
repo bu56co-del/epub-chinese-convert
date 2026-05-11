@@ -753,6 +753,16 @@ def create_app() -> FastAPI:
     app = FastAPI(title="epubconv", docs_url=None, redoc_url=None)
     repo_root = Path(__file__).resolve().parents[3]
 
+    # On every server start, log the git HEAD so the user can confirm
+    # they're actually running the version they just pulled — diagnoses
+    # "I updated but it's still broken" reports in seconds.
+    try:
+        rc, head, _ = _git("rev-parse", "--short", "HEAD", cwd=repo_root)
+        head_label = head if rc == 0 else "unknown"
+    except Exception:
+        head_label = "no-git"
+    logger.info(f"epubconv server starting on git HEAD = {head_label}")
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         opts = "\n".join(f"<option>{name}</option>" for name in list_engines())

@@ -595,6 +595,40 @@ def test_combine_halves_budget_when_proxy_rejects_a_fitting_call(
     assert client.calls >= 2
 
 
+def test_combine_caps_notes_budget_regardless_of_per_call_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even when the UI hands us a huge per_call_budget, combine should
+    never send more than _COMBINE_MAX_PAYLOAD chars of notes — that's
+    what protects us from banana2556's per-message cap."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    monkeypatch.setattr(summarize, "_COMBINE_MAX_PAYLOAD", 1000)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    sizes_sent: list[int] = []
+
+    class SizeTracker:
+        def complete(self, system: str, user: str, **kw) -> str:
+            sizes_sent.append(len(user))
+            return "OK"
+
+    summarize._hierarchical_combine(
+        ["chunk-" + ("X" * 800)] * 8,  # eight 806-char notes
+        client=SizeTracker(),
+        cache=cache,
+        on_progress=lambda *a: None,
+        budget=1_000_000,  # absurd: ratio alone would allow 500K
+        depth=0,
+        max_depth=16,
+    )
+    # Every send (notes + template) must stay near the absolute cap; allow
+    # ~2x cap for template + system prompt overhead.
+    template_overhead = len(summarize._COMBINE_TEMPLATE) + len(summarize._SYSTEM_PROMPT)
+    upper = summarize._COMBINE_MAX_PAYLOAD + template_overhead + 200
+    assert all(s <= upper for s in sizes_sent), (sizes_sent, upper)
+
+
 def test_combine_no_max_depth_ceiling_when_progress_possible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
