@@ -378,6 +378,49 @@ def test_summarize_status_reflects_run_state(
     assert s["latest_stage"] == "done"
 
 
+def test_cancel_endpoint_stops_in_flight_run(
+    client: TestClient,
+    skill_epub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /summarize-cancel sets the cancel event; the worker checks it
+    between LLM calls and emits a final `cancelled` event."""
+    from epubconv import summarize as sm
+    import time as _t
+
+    class SlowClient:
+        def complete(self, system, user, **kw):
+            _t.sleep(0.2)
+            return "### 內容\n- ok"
+
+    monkeypatch.setattr(sm, "LLMClient", lambda cfg: SlowClient())
+    monkeypatch.setattr(sm, "LLMConfig",
+                        type("Cfg", (), {"for_provider": staticmethod(lambda *a, **kw: object())}))
+
+    with skill_epub.open("rb") as fh:
+        r1 = client.post(
+            "/summarize",
+            files={"file": ("novel.epub", fh, "application/epub+zip")},
+            data={"max_chars": "5000", "per_call_budget": "300"},
+        )
+    assert r1.status_code == 200
+
+    # Give the worker a moment to enter the first LLM call.
+    _t.sleep(0.1)
+    cancel = client.post("/summarize-cancel")
+    assert cancel.status_code == 200
+    assert cancel.json()["cancel_requested"] is True
+
+    events = _wait_for_done(client, timeout=10.0)
+    assert events[-1]["stage"] == "cancelled"
+
+
+def test_cancel_endpoint_when_idle_is_noop(client: TestClient) -> None:
+    r = client.post("/summarize-cancel")
+    assert r.status_code == 200
+    assert r.json()["cancel_requested"] is False
+
+
 def test_summarize_returns_409_when_run_already_active(
     client: TestClient,
     skill_epub: Path,

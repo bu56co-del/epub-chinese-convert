@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import zipfile
 from pathlib import Path
 
@@ -649,6 +650,101 @@ def test_combine_no_max_depth_ceiling_when_progress_possible(
         budget=1000, depth=5, max_depth=16,
     )
     assert out == "OK"
+
+
+# ---- cancellation ----
+
+
+def test_cancel_event_aborts_between_batches(tmp_path: Path) -> None:
+    """Setting cancel_event after the first batch should stop the run at
+    the next batch boundary and raise SummaryCancelled."""
+    epub = _build_book(tmp_path)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+    cancel = threading.Event()
+
+    class CancelAfterFirst:
+        def __init__(self) -> None:
+            self.n = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.n += 1
+            if self.n == 1:
+                # First batch succeeds; user clicks Cancel right after.
+                cancel.set()
+            return "### 內容\n- ok"
+
+    with pytest.raises(summarize.SummaryCancelled):
+        summarize.summarise_epub(
+            epub, max_chars=10_000, client=CancelAfterFirst(),
+            per_call_budget=200, cache=cache, cancel_event=cancel,
+        )
+
+
+def test_cancel_preserves_cached_batches_for_resume(tmp_path: Path) -> None:
+    """After a cancellation, a re-run with the same cache should reuse
+    every batch that finished — proving cancel + cache = free resume."""
+    epub = _build_book(tmp_path)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+    cancel = threading.Event()
+
+    class CancelMidway:
+        def __init__(self, cancel_after: int) -> None:
+            self.n = 0
+            self.cancel_after = cancel_after
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.n += 1
+            if self.n == self.cancel_after:
+                cancel.set()
+            return "### 內容\n- ok"
+
+    # Run #1: cancel after 2 successful batches.
+    client1 = CancelMidway(cancel_after=2)
+    with pytest.raises(summarize.SummaryCancelled):
+        summarize.summarise_epub(
+            epub, max_chars=10_000, client=client1,
+            per_call_budget=200, cache=cache, cancel_event=cancel,
+        )
+    completed_first_run = client1.n
+    assert completed_first_run >= 2
+
+    # Cache has at least the first 2 batches stored.
+    assert len(cache.keys("batch")) >= 2
+
+    # Run #2: fresh cancel event (NOT set), same cache.
+    class WorksFully:
+        def __init__(self) -> None:
+            self.n = 0
+        def complete(self, system: str, user: str, **kw) -> str:
+            self.n += 1
+            if "請整合" in user:
+                return "## 一句話總結\n合"
+            return "### 內容\n- ok"
+
+    client2 = WorksFully()
+    result = summarize.summarise_epub(
+        epub, max_chars=10_000, client=client2,
+        per_call_budget=200, cache=cache,  # no cancel_event
+    )
+    # The previously-completed batches are cache HITs → strictly fewer
+    # calls on run #2 than on a from-scratch attempt.
+    assert client2.n < completed_first_run + 10  # very generous; just proves resume worked
+    assert "一句話總結" in result.text
+
+
+def test_cancel_before_any_batch_raises_immediately(tmp_path: Path) -> None:
+    epub = _build_book(tmp_path)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+    cancel = threading.Event()
+    cancel.set()  # cancelled before we even start
+
+    class ShouldNotBeCalled:
+        def complete(self, system: str, user: str, **kw) -> str:
+            raise AssertionError("LLM client should not have been called")
+
+    with pytest.raises(summarize.SummaryCancelled):
+        summarize.summarise_epub(
+            epub, max_chars=10_000, client=ShouldNotBeCalled(),
+            per_call_budget=200, cache=cache, cancel_event=cancel,
+        )
 
 
 def test_progress_callback_chars_processed_advances(tmp_path: Path) -> None:

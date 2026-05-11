@@ -17,6 +17,7 @@ work because they both expose chat-completions.
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,16 @@ from .llm.client import LLMClient, LLMConfig
 from .pipeline import _read_text
 from .skill.extract import clean_text, is_content_file, read_toc
 from .summary_cache import SummaryCache, hash_file, hash_text
+
+
+class SummaryCancelled(Exception):
+    """Raised when the caller's ``cancel_event`` is set between LLM calls.
+
+    Distinct from :class:`SummaryError` so the web layer can surface a
+    user-friendly "cancelled" event rather than treat it as an upstream
+    failure. The disk cache is untouched, so a re-run picks up exactly
+    where the cancel landed.
+    """
 
 # Callback signature for progress streaming. Stages we emit:
 #   "extracting"      — about to read the EPUB
@@ -211,20 +222,28 @@ def summarise_epub(
     per_call_budget: int = _PER_CALL_CHAR_BUDGET,
     progress: ProgressFn | None = None,
     cache: SummaryCache | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Summary:
     """Top-level entry: extract → (chunk if long) → ask LLM → return :class:`Summary`.
 
-    ``progress`` is an optional callback ``progress(stage, data)`` invoked at
-    each stage so the web UI can stream a progress bar.
+    ``progress`` is an optional callback invoked at each stage for the UI.
 
     ``cache`` is an optional :class:`SummaryCache` that stores partial
-    results to disk keyed by content hash. After a partial failure
-    (e.g. combine step too long) a re-run with the same EPUB will reuse
-    every successful batch instead of paying for another round trip.
-    Defaults to a per-book cache under
-    ``$EPUBCONV_CONFIG_DIR/cache/summary/<book_sha>/``.
+    results to disk keyed by content hash.
+
+    ``cancel_event`` is an optional :class:`threading.Event`. When set
+    (from another thread, typically the /summarize-cancel handler) the
+    next checkpoint between LLM calls raises :class:`SummaryCancelled`.
     """
     on_progress = progress or _noop_progress
+    if cancel_event is None:
+        cancel_event = threading.Event()  # never set
+
+    def _check_cancel() -> None:
+        if cancel_event.is_set():
+            raise SummaryCancelled("summarisation cancelled by user request")
+
+    _check_cancel()
     on_progress("extracting", {})
     body, chapters = book_text(epub_path, max_chars=max_chars)
     if not body:
@@ -247,6 +266,7 @@ def summarise_epub(
 
     if len(body) <= per_call_budget:
         logger.info("summarise: single-call path (body fits in one request)")
+        _check_cancel()
         on_progress("batch_start", {
             "batch_no": 1, "budget": per_call_budget, "batch_chars": len(body),
             "chars_processed": 0, "chars_total": len(body),
@@ -266,7 +286,7 @@ def summarise_epub(
     else:
         text = _summarise_long(
             body, client=client, per_call_budget=per_call_budget,
-            on_progress=on_progress, cache=cache,
+            on_progress=on_progress, cache=cache, cancel_event=cancel_event,
         )
 
     return Summary(text=text, chars_used=len(body), chapters_used=chapters)
@@ -303,6 +323,7 @@ def _summarise_long(
     per_call_budget: int,
     on_progress: ProgressFn = _noop_progress,
     cache: SummaryCache,
+    cancel_event: threading.Event,
 ) -> str:
     """Map-reduce with adaptive batch sizing.
 
@@ -336,6 +357,8 @@ def _summarise_long(
     )
 
     while body_remaining.strip():
+        if cancel_event.is_set():
+            raise SummaryCancelled("cancelled between batches")
         # Take the *first* batch under the current budget. We don't
         # pre-split everything because future budgets may shrink.
         first_batch = _split_into_batches(body_remaining, current_budget)[0]
@@ -393,7 +416,7 @@ def _summarise_long(
     started = time.time()
     out = _hierarchical_combine(
         notes, client=client, cache=cache, on_progress=on_progress,
-        budget=current_budget,
+        budget=current_budget, cancel_event=cancel_event,
     )
     on_progress("combine_done", {"elapsed_ms": int((time.time() - started) * 1000)})
     return out
@@ -423,6 +446,7 @@ def _hierarchical_combine(
     budget: int,
     depth: int = 0,
     max_depth: int = 16,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Combine batch notes into the final structured summary.
 
@@ -444,6 +468,8 @@ def _hierarchical_combine(
     condition is "budget below ``_MIN_BATCH_BUDGET``" — at that point
     nothing the model can accept.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        raise SummaryCancelled("cancelled before combine step")
     # Two caps:
     #  - budget * ratio  : leave room for template + output relative to the
     #                       UI's per-call budget
@@ -480,6 +506,7 @@ def _hierarchical_combine(
             return _hierarchical_combine(
                 notes, client=client, cache=cache, on_progress=on_progress,
                 budget=new_budget, depth=depth + 1, max_depth=max_depth,
+                cancel_event=cancel_event,
             )
 
     # ---- doesn't fit: pack and recurse ----
@@ -523,9 +550,12 @@ def _hierarchical_combine(
 
     sub_summaries: list[str] = []
     for group in groups:
+        if cancel_event is not None and cancel_event.is_set():
+            raise SummaryCancelled("cancelled between combine groups")
         sub = _hierarchical_combine(
             group, client=client, cache=cache, on_progress=on_progress,
             budget=budget, depth=depth + 1, max_depth=max_depth,
+            cancel_event=cancel_event,
         )
         sub_summaries.append(sub)
 
@@ -535,6 +565,7 @@ def _hierarchical_combine(
     return _hierarchical_combine(
         sub_summaries, client=client, cache=cache, on_progress=on_progress,
         budget=budget, depth=depth + 1, max_depth=max_depth,
+        cancel_event=cancel_event,
     )
 
 

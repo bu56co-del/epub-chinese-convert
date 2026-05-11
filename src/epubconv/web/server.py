@@ -41,7 +41,7 @@ from ..engines.registry import get_engine, list_engines
 from ..llm.client import PROVIDERS, provider_base_url
 from ..pipeline import convert_epub
 from ..skill.exporter import export_skill
-from ..summarize import SummaryError, summarise_epub
+from ..summarize import SummaryCancelled, SummaryError, summarise_epub
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -215,7 +215,10 @@ INDEX_HTML = """<!DOCTYPE html>
   <p class="muted">Long books are split into batches of <em>per-call budget</em> chars, summarised
     separately, then merged. Lower the budget if you see "Single message too long" / "Input too long"
     upstream errors; raise it on long-context models to use fewer calls.</p>
-  <button type="button" id="btn-summary">Generate summary</button>
+  <div class="row">
+    <button type="button" id="btn-summary">Generate summary</button>
+    <button type="button" id="btn-summary-cancel" class="secondary" style="display:none">Cancel</button>
+  </div>
   <div id="summary-progress" style="display:none">
     <progress id="summary-bar" value="0" max="100" style="width:100%; height:0.6em"></progress>
     <div id="summary-progress-text" class="muted" style="font-family:monospace; font-size:0.85em"></div>
@@ -370,6 +373,18 @@ INDEX_HTML = """<!DOCTYPE html>
   const summaryProgress = document.getElementById("summary-progress");
   const summaryBar = document.getElementById("summary-bar");
   const summaryProgressText = document.getElementById("summary-progress-text");
+  const cancelBtn = document.getElementById("btn-summary-cancel");
+
+  cancelBtn.addEventListener("click", async () => {
+    if (!confirm("Cancel the current summarisation? Cached batches will be preserved, so you can resume by clicking Generate summary again.")) return;
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = "Cancelling…";
+    try {
+      await fetch("/summarize-cancel", { method: "POST" });
+    } catch (e) {
+      summaryStatus.textContent = "Cancel request failed: " + e;
+    }
+  });
 
   function fmt(n) { return n.toLocaleString(); }
 
@@ -414,6 +429,11 @@ INDEX_HTML = """<!DOCTYPE html>
         `Summarised ${ev.chapters_used} chapters (${fmt(ev.chars_used)} chars).`;
       summaryOut.style.display = "block";
       summaryOut.innerHTML = simpleMarkdown(ev.text);
+      cancelBtn.style.display = "none";
+    } else if (ev.stage === "cancelled") {
+      summaryStatus.textContent =
+        "Cancelled. " + (ev.note || "") + " Click Generate summary again to resume.";
+      cancelBtn.style.display = "none";
     } else if (ev.stage === "error") {
       let msg = "Error: " + ev.detail;
       if (typeof ev.detail === "string") {
@@ -491,6 +511,9 @@ INDEX_HTML = """<!DOCTYPE html>
     summaryProgress.style.display = "block";
     summaryBar.value = 0;
     summaryProgressText.textContent = "Starting…";
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.display = "inline-block";
 
     const fd = new FormData(summaryForm);
     const provider = fd.get("provider");
@@ -533,6 +556,12 @@ INDEX_HTML = """<!DOCTYPE html>
         summaryProgressText.textContent = s.active
           ? "Reattaching to in-progress summarisation…"
           : "Replaying the last summarisation…";
+        summaryProgress.style.display = "block";
+        if (s.active) {
+          cancelBtn.disabled = false;
+          cancelBtn.textContent = "Cancel";
+          cancelBtn.style.display = "inline-block";
+        }
         attachSummaryStream();
       }
     } catch (e) { /* offline; nothing to do */ }
@@ -928,6 +957,7 @@ def create_app() -> FastAPI:
         "events": [],            # list of dicts emitted so far (replay buffer)
         "subscribers": [],       # list of (asyncio.Queue, asyncio.AbstractEventLoop)
         "started_at": 0.0,
+        "cancel_event": None,    # threading.Event for the current run, or None
     }
 
     def _emit_summary_event(event: dict) -> None:
@@ -949,6 +979,14 @@ def create_app() -> FastAPI:
                 "text": result.text,
                 "chars_used": result.chars_used,
                 "chapters_used": result.chapters_used,
+            })
+        except SummaryCancelled as exc:
+            logger.info("summarize task: cancelled — {exc}", exc=exc)
+            _emit_summary_event({
+                "stage": "cancelled",
+                "message": str(exc),
+                "note": "Cached batches and sub-summaries preserved. "
+                        "Re-click Generate summary to resume from where you stopped.",
             })
         except ValueError as exc:
             logger.warning("summarize task: 400 {exc}", exc=exc)
@@ -998,10 +1036,12 @@ def create_app() -> FastAPI:
         )
 
         # Reset replay buffer for this new run.
+        cancel_event = threading.Event()
         summary_run["active"] = True
         summary_run["events"] = []
         summary_run["subscribers"] = []
         summary_run["started_at"] = __import__("time").time()
+        summary_run["cancel_event"] = cancel_event
 
         threading.Thread(
             target=_summary_worker,
@@ -1012,10 +1052,28 @@ def create_app() -> FastAPI:
                 provider=provider,
                 model=model or None,
                 api_key=api_key or None,
+                cancel_event=cancel_event,
             ),
             daemon=True,
         ).start()
         return JSONResponse({"started": True, "started_at": summary_run["started_at"]})
+
+    @app.post("/summarize-cancel")
+    def summarize_cancel_endpoint() -> JSONResponse:
+        """Politely ask the in-flight summarisation to stop.
+
+        The worker only checks the cancel flag *between* LLM calls, so an
+        already-in-flight chat-completions request will finish (≤ 30-60s
+        typically). Cached results are untouched — re-clicking Generate
+        summary picks up exactly where the cancel landed.
+        """
+        if not summary_run.get("active"):
+            return JSONResponse({"cancel_requested": False, "reason": "no active run"})
+        event = summary_run.get("cancel_event")
+        if event is not None and not event.is_set():
+            event.set()
+            logger.info("summarize: cancel requested")
+        return JSONResponse({"cancel_requested": True})
 
     @app.get("/summarize-stream")
     async def summarize_stream() -> StreamingResponse:
