@@ -39,7 +39,12 @@ from ..converters.writing_mode import WRITING_MODES
 from ..diff import build_diff_report
 from ..engines.registry import get_engine, list_engines
 from ..llm.client import PROVIDERS, provider_base_url
-from ..pipeline import convert_epub
+from ..formats.calibre import (
+    OUTPUT_FORMATS as EBOOK_OUTPUT_FORMATS,
+    CalibreNotFoundError,
+    detect_format as detect_ebook_format,
+)
+from ..pipeline import convert_ebook, convert_epub
 from ..skill.exporter import export_skill
 from ..summarize import SummaryCancelled, SummaryError, summarise_epub
 
@@ -148,8 +153,11 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <section id="t-convert" class="panel active">
 <form id="f-convert" enctype="multipart/form-data" action="/convert" method="post">
-  <h3>Convert EPUB between Chinese variants</h3>
-  <label>EPUB <input type="file" name="file" accept=".epub" required></label>
+  <h3>Convert ebook between Chinese variants & formats</h3>
+  <p class="muted">Input may be EPUB / MOBI / AZW3 (Kindle). Cross-format conversion uses Calibre's
+    <code>ebook-convert</code> (install <a href="https://calibre-ebook.com" target="_blank">Calibre</a>
+    if you want non-EPUB output).</p>
+  <label>Source file <input type="file" name="file" accept=".epub,.mobi,.azw3,.azw" required></label>
   <div class="row">
     <label>From <select name="source_lang">
       <option>zh-CN</option><option>zh-Hans</option><option>zh-TW</option><option>zh-HK</option><option>zh-Hant</option>
@@ -159,11 +167,16 @@ INDEX_HTML = """<!DOCTYPE html>
     </select></label>
   </div>
   <div class="row">
+    <label>Output format <select name="output_format">
+      <option value="epub">EPUB</option>
+      <option value="mobi">MOBI (older Kindle)</option>
+      <option value="azw3">AZW3 (Kindle KF8)</option>
+    </select></label>
     <label>Writing mode <select name="writing_mode">
       <option>preserve</option><option>horizontal</option><option>vertical</option>
     </select></label>
-    <label>Engine <select name="engine_name">__ENGINE_OPTIONS__</select></label>
   </div>
+  <label>Engine <select name="engine_name">__ENGINE_OPTIONS__</select></label>
   <button type="submit">Convert &rarr; download</button>
 </form>
 </section>
@@ -930,25 +943,49 @@ def create_app() -> FastAPI:
         target_lang: str = Form("zh-TW"),
         writing_mode: str = Form("preserve"),
         engine_name: str = Form("opencc"),
+        output_format: str = Form("epub"),
     ) -> FileResponse:
         if writing_mode not in WRITING_MODES:
             raise HTTPException(status_code=400, detail=f"writing_mode must be one of {WRITING_MODES}")
+        if output_format not in EBOOK_OUTPUT_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"output_format must be one of {EBOOK_OUTPUT_FORMATS}",
+            )
 
         upload_name = file.filename or "input.epub"
         tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-web-"))
         src = tmp_dir / upload_name
         src.write_bytes(await file.read())
-        dst = tmp_dir / f"{Path(upload_name).stem}.{target_lang}.epub"
+        try:
+            src_fmt = detect_ebook_format(src)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        dst = tmp_dir / f"{Path(upload_name).stem}.{target_lang}.{output_format}"
 
         try:
             engine = get_engine(engine_name, source_lang, target_lang)
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-        convert_epub(src, dst, engine, target_lang, writing_mode=writing_mode)
+        try:
+            convert_ebook(
+                src, dst, engine, target_lang,
+                writing_mode=writing_mode, output_format=output_format,
+            )
+        except CalibreNotFoundError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        media_types = {
+            "epub": "application/epub+zip",
+            "mobi": "application/x-mobipocket-ebook",
+            "azw3": "application/vnd.amazon.ebook",
+        }
+        logger.info(f"convert: {src_fmt} -> {output_format} for {upload_name}")
         return FileResponse(
             path=dst,
-            media_type="application/epub+zip",
+            media_type=media_types.get(output_format, "application/octet-stream"),
             filename=dst.name,
         )
 

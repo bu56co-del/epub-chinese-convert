@@ -94,6 +94,64 @@ def test_convert_rejects_bad_writing_mode(client: TestClient, sample_epub: Path)
     assert r.status_code == 400
 
 
+def test_convert_form_has_format_dropdown(client: TestClient) -> None:
+    text = client.get("/").text
+    assert 'name="output_format"' in text
+    for fmt in ("EPUB", "MOBI", "AZW3"):
+        assert fmt in text
+    # File picker accepts the additional formats.
+    assert ".mobi" in text
+    assert ".azw3" in text
+
+
+def test_convert_endpoint_accepts_output_format(
+    client: TestClient, sample_epub: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output format flows through to convert_ebook."""
+    from epubconv.web import server as srv
+    seen: dict = {}
+
+    def fake_convert(src, dst, engine, target_lang, **kwargs):
+        seen["dst"] = dst
+        seen["output_format"] = kwargs.get("output_format")
+        dst.write_bytes(b"FAKE")
+        return dst
+
+    monkeypatch.setattr(srv, "convert_ebook", fake_convert)
+    with sample_epub.open("rb") as fh:
+        r = client.post(
+            "/convert",
+            files={"file": ("sample.epub", fh, "application/epub+zip")},
+            data={"output_format": "azw3"},
+        )
+    assert r.status_code == 200
+    assert seen["output_format"] == "azw3"
+    assert seen["dst"].suffix == ".azw3"
+    assert r.headers["content-type"] == "application/vnd.amazon.ebook"
+
+
+def test_convert_endpoint_rejects_unknown_output_format(
+    client: TestClient, sample_epub: Path,
+) -> None:
+    with sample_epub.open("rb") as fh:
+        r = client.post(
+            "/convert",
+            files={"file": ("sample.epub", fh, "application/epub+zip")},
+            data={"output_format": "pdf"},
+        )
+    assert r.status_code == 400
+
+
+def test_convert_endpoint_rejects_unknown_input_extension(
+    client: TestClient,
+) -> None:
+    r = client.post(
+        "/convert",
+        files={"file": ("junk.pdf", b"garbage", "application/pdf")},
+    )
+    assert r.status_code == 400
+
+
 def test_convert_rejects_unknown_engine(client: TestClient, sample_epub: Path) -> None:
     with sample_epub.open("rb") as fh:
         r = client.post(
