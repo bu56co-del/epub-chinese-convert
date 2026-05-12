@@ -199,6 +199,9 @@ _COMBINE_TEMPLATE = """以下係本書按章節順序拆成幾段嘅筆記。
 ## 寫作風格 / 體裁
 （一段，整合各段觀察，描述語氣、節奏、敘事視角）
 
+**重要：輸出全文總長度唔可以超過 {target_chars} 字符**（包括所有 markdown 符號）。
+如果原文太多，優先合併同精簡 — 寧願短啲都唔好超過字數上限，每章寫一句就夠。
+
 ---
 
 {notes}
@@ -445,7 +448,7 @@ def _hierarchical_combine(
     on_progress: ProgressFn,
     budget: int,
     depth: int = 0,
-    max_depth: int = 16,
+    max_depth: int = 24,
     cancel_event: threading.Event | None = None,
 ) -> str:
     """Combine batch notes into the final structured summary.
@@ -476,12 +479,16 @@ def _hierarchical_combine(
     #  - _COMBINE_MAX_PAYLOAD : absolute floor on what banana2556 / claude-
     #                       haiku-4.5-as can swallow regardless of the UI
     notes_budget = max(1, min(int(budget * _COMBINE_PAYLOAD_RATIO), _COMBINE_MAX_PAYLOAD))
+    # Target output size — small enough that the next round's packing will
+    # actually consolidate (you need output << notes_budget so 2+ outputs
+    # can fit into one group; otherwise we loop forever at the same size).
+    target_chars = max(_MIN_BATCH_BUDGET, notes_budget // 3)
     merged = "\n\n".join(notes)
     stage = f"combine@d{depth}"
 
     fits = len(merged) <= notes_budget
     if fits:
-        prompt = _COMBINE_TEMPLATE.format(notes=merged)
+        prompt = _COMBINE_TEMPLATE.format(notes=merged, target_chars=target_chars)
         try:
             return _cached_call(
                 client, cache, "combine", merged,
@@ -511,18 +518,16 @@ def _hierarchical_combine(
 
     # ---- doesn't fit: pack and recurse ----
     if depth >= max_depth:
-        logger.error(
-            "summarise[{stage}]: max_depth {max} reached with {n} notes ({chars} chars); "
-            "calling anyway as a last resort",
-            stage=stage, max=max_depth, n=len(notes), chars=len(merged),
-        )
-        # As a last resort try the call; let it fail with a real upstream error
-        # rather than recursing infinitely.
-        prompt = _COMBINE_TEMPLATE.format(notes=merged)
-        return _cached_call(
-            client, cache, "combine", merged,
-            stage_label=stage, system=_SYSTEM_PROMPT, user=prompt,
-            batch_chars=len(merged),
+        # The recursion didn't converge. This used to silently call the LLM
+        # with an over-sized payload as a "last resort" — which never works
+        # and just wastes a call. Surface a useful error instead so the user
+        # can lower per_call_budget / model output verbosity.
+        raise SummaryError(
+            f"combine recursion stuck at depth {depth} with {len(notes)} notes "
+            f"totalling {len(merged)} chars (notes_budget={notes_budget}). "
+            "Output isn't shrinking enough between rounds — try a smaller "
+            "per_call_budget or a model that follows length instructions more "
+            "strictly."
         )
 
     groups = _pack_notes_under_budget(notes, notes_budget)

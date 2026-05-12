@@ -596,6 +596,70 @@ def test_combine_halves_budget_when_proxy_rejects_a_fitting_call(
     assert client.calls >= 2
 
 
+def test_combine_template_carries_target_chars() -> None:
+    """The combine template must instruct the model on max output length —
+    without this, output won't shrink between rounds and the recursion
+    can't converge."""
+    assert "{target_chars}" in summarize._COMBINE_TEMPLATE
+
+
+def test_combine_passes_target_chars_to_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+    seen_targets: list[int] = []
+
+    class TargetCaptor:
+        def complete(self, system: str, user: str, **kw) -> str:
+            import re as _re
+            m = _re.search(r"唔可以超過 (\d+) 字符", user)
+            if m:
+                seen_targets.append(int(m.group(1)))
+            return "OK"
+
+    summarize._hierarchical_combine(
+        ["A" * 200, "B" * 200],
+        client=TargetCaptor(),
+        cache=cache,
+        on_progress=lambda *a: None,
+        budget=1500,  # notes_budget = min(750, 6000) = 750; target = 250
+        depth=0,
+        max_depth=10,
+    )
+    assert seen_targets, "expected at least one combine call with target_chars hint"
+    assert all(t > 0 for t in seen_targets)
+    assert all(t < 1500 for t in seen_targets)  # target is smaller than budget
+
+
+def test_combine_raises_useful_error_when_stuck_at_max_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Previously the max_depth path silently called with oversized input;
+    now it raises a SummaryError pointing the user at what to tweak."""
+    monkeypatch.setattr(summarize, "_MIN_BATCH_BUDGET", 50)
+    cache = summarize.SummaryCache(book_id="b", root=tmp_path / "cache")
+
+    class NeverShrinks:
+        """Always returns 1000-char output regardless of input — simulates
+        a model that ignores target_chars."""
+        def complete(self, system: str, user: str, **kw) -> str:
+            return "X" * 1000
+
+    with pytest.raises(summarize.SummaryError, match="stuck at depth"):
+        summarize._hierarchical_combine(
+            ["chunk" * 200] * 20,  # 20 notes × 1000 chars = 20K
+            client=NeverShrinks(),
+            cache=cache,
+            on_progress=lambda *a: None,
+            budget=1000,  # notes_budget = 500
+            depth=0,
+            max_depth=4,
+        )
+
+
 def test_combine_caps_notes_budget_regardless_of_per_call_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
