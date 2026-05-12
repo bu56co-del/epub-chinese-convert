@@ -307,6 +307,14 @@ def _wait_for_done(client: TestClient, timeout: float = 5.0) -> list[dict]:
     return _parse_sse_events(r.text)
 
 
+def test_index_has_pdf_download_and_print_container(client: TestClient) -> None:
+    text = client.get("/").text
+    assert "Download PDF" in text
+    assert 'id="print-container"' in text
+    assert 'id="print-title"' in text
+    assert "@media print" in text
+
+
 def test_summarize_endpoint_starts_task_and_streams_done(
     client: TestClient,
     skill_epub: Path,
@@ -340,8 +348,15 @@ def test_summarize_endpoint_starts_task_and_streams_done(
     assert "batch_start" in stages
     assert "batch_done" in stages
     assert stages[-1] == "done"
+    # `extracted` carries title + creator so the UI can show them
+    # alongside the progress bar before the run finishes.
+    extracted = next(e for e in events if e["stage"] == "extracted")
+    assert extracted["title"] == "测试小说"
+    assert extracted["creator"] == "张三"
     final = events[-1]
     assert "一句話總結" in final["text"]
+    assert final["title"] == "测试小说"
+    assert final["creator"] == "张三"
 
 
 def test_summarize_status_reflects_run_state(

@@ -113,6 +113,20 @@ INDEX_HTML = """<!DOCTYPE html>
   progress::-webkit-progress-bar { background: var(--bg); border-radius: 4px; }
   progress::-webkit-progress-value { background: var(--accent); border-radius: 4px; transition: width 0.2s; }
   progress::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
+  .summary-header { margin-top: 1.5em; padding-bottom: 0.5em; border-bottom: 1px solid var(--border); }
+  .summary-header h2 { margin: 0; color: var(--text-strong); }
+  .summary-header .creator { color: var(--text-muted); font-size: 0.9em; margin-top: 0.25em; }
+  .print-only { display: none; }
+  @media print {
+    /* Hide everything except the print container, then unhide it. */
+    body > * { display: none !important; }
+    body > #print-container { display: block !important; }
+    #print-container { color: #000; background: #fff; padding: 0; max-width: 100%; }
+    #print-container h1, #print-container h2, #print-container h3 { color: #000; }
+    #print-container .creator { color: #555; font-size: 0.95em; margin-bottom: 1em; }
+    #print-container .summary-md { background: transparent; border: 0; padding: 0; }
+    #print-container code { background: #f0f0f0; }
+  }
 </style>
 </head>
 <body>
@@ -224,9 +238,23 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="summary-progress-text" class="muted" style="font-family:monospace; font-size:0.85em"></div>
   </div>
   <div id="summary-status" class="muted"></div>
+  <div id="summary-header" class="summary-header" style="display:none">
+    <h2 id="summary-title"></h2>
+    <div id="summary-creator" class="creator"></div>
+    <div style="margin-top:0.5em">
+      <button type="button" id="btn-summary-pdf" class="secondary">📄 Download PDF</button>
+    </div>
+  </div>
   <div id="summary-out" class="summary-md" style="display:none"></div>
 </form>
 </section>
+
+<!-- Hidden container shown only during print; populated by the PDF button. -->
+<div id="print-container" class="print-only">
+  <h1 id="print-title"></h1>
+  <div id="print-creator" class="creator"></div>
+  <div id="print-summary" class="summary-md"></div>
+</div>
 
 <section id="t-settings" class="panel">
 <form id="f-settings">
@@ -374,6 +402,23 @@ INDEX_HTML = """<!DOCTYPE html>
   const summaryBar = document.getElementById("summary-bar");
   const summaryProgressText = document.getElementById("summary-progress-text");
   const cancelBtn = document.getElementById("btn-summary-cancel");
+  const summaryHeader = document.getElementById("summary-header");
+  const summaryTitle = document.getElementById("summary-title");
+  const summaryCreator = document.getElementById("summary-creator");
+  const pdfBtn = document.getElementById("btn-summary-pdf");
+  let currentTitle = "";
+  let currentCreator = "";
+
+  pdfBtn.addEventListener("click", () => {
+    // Populate the print container with the current summary, then trigger
+    // the browser's print dialog so the user can pick "Save as PDF".
+    document.getElementById("print-title").textContent =
+      currentTitle || "Book summary";
+    document.getElementById("print-creator").textContent =
+      currentCreator ? `作者：${currentCreator}` : "";
+    document.getElementById("print-summary").innerHTML = summaryOut.innerHTML;
+    window.print();
+  });
 
   cancelBtn.addEventListener("click", async () => {
     if (!confirm("Cancel the current summarisation? Cached batches will be preserved, so you can resume by clicking Generate summary again.")) return;
@@ -396,8 +441,13 @@ INDEX_HTML = """<!DOCTYPE html>
     if (ev.stage === "extracting") {
       summaryProgressText.textContent = "Reading EPUB…";
     } else if (ev.stage === "extracted") {
+      if (ev.title) currentTitle = ev.title;
+      if (ev.creator) currentCreator = ev.creator;
+      const titleLabel = ev.title
+        ? `《${ev.title}》${ev.creator ? "（" + ev.creator + "）" : ""} — `
+        : "";
       summaryProgressText.textContent =
-        `Found ${ev.chapters} chapters, ${fmt(total)} chars to process.`;
+        `${titleLabel}Found ${ev.chapters} chapters, ${fmt(total)} chars to process.`;
     } else if (ev.stage === "batch_start") {
       summaryBar.value = pct;
       summaryProgressText.textContent =
@@ -427,6 +477,15 @@ INDEX_HTML = """<!DOCTYPE html>
       summaryBar.value = 100;
       summaryStatus.textContent =
         `Summarised ${ev.chapters_used} chapters (${fmt(ev.chars_used)} chars).`;
+      if (ev.title) currentTitle = ev.title;
+      if (ev.creator) currentCreator = ev.creator;
+      if (currentTitle) {
+        summaryTitle.textContent = `《${currentTitle}》`;
+        summaryCreator.textContent = currentCreator ? `作者：${currentCreator}` : "";
+        summaryHeader.style.display = "block";
+      } else {
+        summaryHeader.style.display = "none";
+      }
       summaryOut.style.display = "block";
       summaryOut.innerHTML = simpleMarkdown(ev.text);
       cancelBtn.style.display = "none";
@@ -508,6 +567,9 @@ INDEX_HTML = """<!DOCTYPE html>
   document.getElementById("btn-summary").addEventListener("click", async () => {
     summaryStatus.textContent = "";
     summaryOut.style.display = "none";
+    summaryHeader.style.display = "none";
+    currentTitle = "";
+    currentCreator = "";
     summaryProgress.style.display = "block";
     summaryBar.value = 0;
     summaryProgressText.textContent = "Starting…";
@@ -979,6 +1041,8 @@ def create_app() -> FastAPI:
                 "text": result.text,
                 "chars_used": result.chars_used,
                 "chapters_used": result.chapters_used,
+                "title": result.title,
+                "creator": result.creator,
             })
         except SummaryCancelled as exc:
             logger.info("summarize task: cancelled — {exc}", exc=exc)

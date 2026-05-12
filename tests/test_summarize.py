@@ -58,16 +58,30 @@ def _build_book(tmp_path: Path) -> Path:
 
 def test_book_text_returns_chapters_in_order(tmp_path: Path) -> None:
     epub = _build_book(tmp_path)
-    text, chapters = summarize.book_text(epub, max_chars=100_000)
+    text, chapters, meta = summarize.book_text(epub, max_chars=100_000)
     assert chapters == 2
     # Order matters: chapter 1 appears before chapter 2.
     assert text.index("第一章") < text.index("第二章")
+    # Metadata comes back so the UI can show the book name.
+    assert meta.get("title") == "測試"
 
 
 def test_book_text_truncates_to_max_chars(tmp_path: Path) -> None:
     epub = _build_book(tmp_path)
-    text, _ = summarize.book_text(epub, max_chars=200)
+    text, _, _ = summarize.book_text(epub, max_chars=200)
     assert len(text) <= 200
+
+
+def test_summarise_epub_returns_title_and_creator(tmp_path: Path) -> None:
+    epub = _build_book(tmp_path)
+
+    class FakeClient:
+        def complete(self, system, user, **kw): return "## 一句話總結\n測"
+
+    result = summarize.summarise_epub(epub, max_chars=10_000, client=FakeClient())
+    assert result.title == "測試"
+    # Fixture has no creator → empty string, not a crash.
+    assert isinstance(result.creator, str)
 
 
 def test_summarise_epub_calls_llm_with_truncated_text(

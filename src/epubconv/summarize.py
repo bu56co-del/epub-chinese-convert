@@ -114,15 +114,21 @@ class Summary:
     text: str          # markdown
     chars_used: int    # how many chars of source we sent
     chapters_used: int
+    title: str = ""    # from OPF <dc:title>
+    creator: str = ""  # from OPF <dc:creator>
 
 
-def book_text(epub_path: Path, *, max_chars: int = DEFAULT_MAX_CHARS) -> tuple[str, int]:
+def book_text(
+    epub_path: Path, *, max_chars: int = DEFAULT_MAX_CHARS,
+) -> tuple[str, int, dict[str, str | list[str]]]:
     """Concatenate visible chapter text in TOC order, capped at ``max_chars``.
 
-    Returns ``(text, chapter_count)``.
+    Returns ``(text, chapter_count, metadata)``. ``metadata`` is the dict
+    of OPF ``<dc:*>`` elements (title, creator, language, description, …).
     """
     with tempfile.TemporaryDirectory(prefix="epubconv-summary-") as tmp:
         pkg = extract_epub(epub_path, Path(tmp))
+        metadata = pkg.metadata()
         toc = [e for e in read_toc(pkg) if is_content_file(e.src)]
 
         parts: list[str] = []
@@ -147,7 +153,7 @@ def book_text(epub_path: Path, *, max_chars: int = DEFAULT_MAX_CHARS) -> tuple[s
             parts.append(block)
             total += len(block) + glue
             used += 1
-        return "\n\n".join(parts), used
+        return "\n\n".join(parts), used, metadata
 
 
 _CHUNK_TEMPLATE = """以下係本書嘅其中一段（可能包含多章）。請只係抽取以下資料，
@@ -248,11 +254,21 @@ def summarise_epub(
 
     _check_cancel()
     on_progress("extracting", {})
-    body, chapters = book_text(epub_path, max_chars=max_chars)
+    body, chapters, metadata = book_text(epub_path, max_chars=max_chars)
     if not body:
         raise ValueError(f"no readable text in {epub_path}")
 
-    on_progress("extracted", {"chars_total": len(body), "chapters": chapters})
+    def _first(value) -> str:
+        if isinstance(value, list):
+            return value[0] if value else ""
+        return str(value or "")
+
+    title = _first(metadata.get("title", ""))
+    creator = _first(metadata.get("creator", ""))
+    on_progress("extracted", {
+        "chars_total": len(body), "chapters": chapters,
+        "title": title, "creator": creator,
+    })
 
     if client is None:
         cfg = LLMConfig.for_provider(provider, model=model or DEFAULT_MODEL, api_key=api_key)
@@ -292,7 +308,10 @@ def summarise_epub(
             on_progress=on_progress, cache=cache, cancel_event=cancel_event,
         )
 
-    return Summary(text=text, chars_used=len(body), chapters_used=chapters)
+    return Summary(
+        text=text, chars_used=len(body), chapters_used=chapters,
+        title=title, creator=creator,
+    )
 
 
 def _cached_call(
