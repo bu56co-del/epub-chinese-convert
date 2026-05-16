@@ -157,30 +157,43 @@
 
   <!-- Returning users: their server was up before, just needs to be re-started. -->
   <div class="overlay-not-running" style="display:none">
-    <p style="margin-top:1.5em">
-      Your local server isn't running. Double-click your launcher in
-      Finder / Explorer, or paste this into a terminal:
-    </p>
-    <div>
-      <span class="install-cmd" id="launch-cmd">open ~/Apps/epubconv/launch.command</span>
-      <button type="button" class="copy" id="launch-copy">Copy</button>
+    <p style="margin-top:1.5em">Your local server isn't running.</p>
+
+    <div style="background:var(--bg-raised);border:1px solid var(--border);border-radius:8px;padding:1em;margin-top:1em;text-align:left">
+      <label style="display:block;font-weight:600;color:var(--text-strong);margin-bottom:0.4em">
+        Your launcher path
+      </label>
+      <div style="display:flex;gap:0.5em;align-items:stretch">
+        <input type="text" id="launch-path-input"
+               placeholder="/Users/yakafung/Apps/epubconv/launch.command"
+               style="flex:1;padding:0.6em;background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,monospace;font-size:0.9em">
+        <button type="button" id="launch-path-pick"
+                style="background:var(--bg-hover);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:0 1em;cursor:pointer">
+          Pick…
+        </button>
+        <button type="button" id="save-launch-path"
+                style="background:var(--accent);color:#0f172a;border:0;border-radius:6px;padding:0 1.2em;cursor:pointer;font-weight:600">
+          Save
+        </button>
+      </div>
+      <input type="file" id="launch-path-file" accept=".command,.bat,.sh"
+             style="display:none">
+      <p class="muted" style="margin-top:0.5em;font-size:0.82em">
+        Tip: drag <code>launch.command</code> from Finder onto Terminal to print
+        its full path, then paste here. (Browsers won't let "Pick" auto-fill
+        the absolute path for security — Pick only confirms the file exists.)
+      </p>
     </div>
-    <p style="margin-top:0.8em" class="muted">
-      Saved launcher path:
-      <span id="saved-launch-path" style="color:var(--text-strong)">(none yet)</span>
-      <button type="button" id="edit-launch-path"
-              style="background:none;border:0;color:var(--accent);cursor:pointer;padding:0;font-size:inherit;text-decoration:underline">
-        change
-      </button>
-    </p>
-    <div id="edit-launch-path-row" style="display:none;margin-top:0.5em">
-      <input type="text" id="launch-path-input"
-             placeholder="/Users/yakafung/Apps/epubconv/launch.command"
-             style="width:80%;padding:0.5em;background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,monospace;font-size:0.9em">
-      <button type="button" id="save-launch-path"
-              style="background:var(--accent);color:#0f172a;border:0;border-radius:6px;padding:0.5em 1em;cursor:pointer;font-weight:600">
-        Save
-      </button>
+
+    <div id="launch-cmd-block" style="margin-top:1em;display:none">
+      <p style="margin-bottom:0.4em">Open Terminal and run:</p>
+      <div>
+        <span class="install-cmd" id="launch-cmd"></span>
+        <button type="button" class="copy" id="launch-copy">Copy</button>
+      </div>
+      <p class="muted" style="margin-top:0.6em">
+        Or just double-click <code id="launch-cmd-filename"></code> in Finder.
+      </p>
     </div>
   </div>
 
@@ -871,19 +884,18 @@
   function renderLaunchCmd() {
     const path = localStorage.getItem(LAUNCH_PATH_KEY) || "";
     const plat = localStorage.getItem(LAUNCH_PLATFORM_KEY) || "";
+    const block = document.getElementById("launch-cmd-block");
     const cmdEl = document.getElementById("launch-cmd");
-    const savedEl = document.getElementById("saved-launch-path");
+    const fnEl = document.getElementById("launch-cmd-filename");
+    const input = document.getElementById("launch-path-input");
+    input.value = path;
     if (path) {
       const isWin = plat.startsWith("win") || path.toLowerCase().endsWith(".bat");
-      cmdEl.textContent = isWin
-        ? `start "" "${path}"`
-        : `open "${path}"`;
-      savedEl.textContent = path;
-      savedEl.style.color = "var(--text-strong)";
+      cmdEl.textContent = isWin ? `start "" "${path}"` : `open "${path}"`;
+      fnEl.textContent = path.split("/").pop().split("\\").pop();
+      block.style.display = "block";
     } else {
-      cmdEl.textContent = "open ~/Apps/epubconv/launch.command";
-      savedEl.textContent = "(none yet — auto-saves on first successful connection)";
-      savedEl.style.color = "var(--text-muted)";
+      block.style.display = "none";
     }
   }
 
@@ -898,14 +910,28 @@
     } catch (e) {}
   });
 
-  document.getElementById("edit-launch-path").addEventListener("click", () => {
-    const row = document.getElementById("edit-launch-path-row");
-    row.style.display = row.style.display === "none" ? "block" : "none";
-    if (row.style.display === "block") {
-      const input = document.getElementById("launch-path-input");
-      input.value = localStorage.getItem(LAUNCH_PATH_KEY) || "";
-      input.focus();
+  // "Pick…" opens the native file dialog. Browsers won't tell us the
+  // absolute path (security), but the picker DOES tell us the filename —
+  // we use it as a hint and prompt the user to paste the directory part
+  // in the text input.
+  const filePicker = document.getElementById("launch-path-file");
+  document.getElementById("launch-path-pick").addEventListener("click", () => {
+    filePicker.click();
+  });
+  filePicker.addEventListener("change", () => {
+    const f = filePicker.files && filePicker.files[0];
+    if (!f) return;
+    const input = document.getElementById("launch-path-input");
+    if (!input.value || input.value.endsWith("/") || input.value.endsWith("\\")) {
+      // No existing path text — drop the filename in so user only has to
+      // prepend the directory.
+      input.value = (input.value || "~/Apps/epubconv/") + f.name;
+    } else {
+      // User has a path already; replace just the basename portion.
+      input.value = input.value.replace(/[^/\\]*$/, f.name);
     }
+    input.focus();
+    input.setSelectionRange(0, input.value.length - f.name.length);
   });
 
   document.getElementById("save-launch-path").addEventListener("click", () => {
@@ -913,7 +939,6 @@
     const value = input.value.trim();
     if (value) {
       localStorage.setItem(LAUNCH_PATH_KEY, value);
-      // Heuristic platform tag from the path itself.
       localStorage.setItem(
         LAUNCH_PLATFORM_KEY,
         value.toLowerCase().endsWith(".bat") ? "win32" : "darwin",
@@ -922,8 +947,14 @@
       localStorage.removeItem(LAUNCH_PATH_KEY);
       localStorage.removeItem(LAUNCH_PLATFORM_KEY);
     }
-    document.getElementById("edit-launch-path-row").style.display = "none";
     renderLaunchCmd();
+  });
+
+  document.getElementById("launch-path-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("save-launch-path").click();
+    }
   });
 
   function updateOverlayMode() {
@@ -954,11 +985,12 @@
       installOverlay.style.display = "none";
       appShell.style.display = "block";
       localStorage.setItem(HAS_INSTALLED_KEY, "1");
-      // Remember exactly which launcher to recommend if the server stops.
-      if (health.launch_path) {
+      // Only seed the launcher path on the very first connection ever, so
+      // we never overwrite a value the user picked manually.
+      if (health.launch_path && !localStorage.getItem(LAUNCH_PATH_KEY)) {
         localStorage.setItem(LAUNCH_PATH_KEY, health.launch_path);
       }
-      if (health.platform) {
+      if (health.platform && !localStorage.getItem(LAUNCH_PLATFORM_KEY)) {
         localStorage.setItem(LAUNCH_PLATFORM_KEY, health.platform);
       }
       return true;
