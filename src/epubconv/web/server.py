@@ -140,7 +140,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <header>
   <h1>epubconv</h1>
   <div>
-    <button id="btn-update" class="secondary">↻ Update &amp; Relaunch</button>
+    <button id="btn-update" class="secondary">Update &amp; Relaunch</button>
     <span id="update-status"></span>
   </div>
 </header>
@@ -150,7 +150,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <button class="tab" data-tab="diff">Diff</button>
   <button class="tab" data-tab="skill">Export Skill</button>
   <button class="tab" data-tab="summary">Summary</button>
-  <button class="tab" data-tab="settings">⚙ Settings</button>
+  <button class="tab" data-tab="settings">Settings</button>
 </div>
 
 <section id="t-convert" class="panel active">
@@ -225,7 +225,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <form id="f-summary" enctype="multipart/form-data">
   <h3>One-click book summary</h3>
   <p class="muted">Sends the book's text through an LLM and returns a structured summary.
-    The API key from the <strong>⚙ Settings</strong> tab (browser localStorage) is sent
+    The API key from the <strong>Settings</strong> tab (browser localStorage) is sent
     along with each request.</p>
   <label>EPUB <input type="file" name="file" accept=".epub" required></label>
   <div class="row">
@@ -257,7 +257,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <h2 id="summary-title"></h2>
     <div id="summary-creator" class="creator"></div>
     <div style="margin-top:0.5em">
-      <button type="button" id="btn-summary-pdf" class="secondary">📄 Download PDF</button>
+      <button type="button" id="btn-summary-pdf" class="secondary">Download PDF</button>
     </div>
   </div>
   <div id="summary-out" class="summary-md" style="display:none"></div>

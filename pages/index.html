@@ -17,7 +17,7 @@
 </header>
 
 <div id="backend-up" style="display:none;background:var(--bg-raised);border:1px solid var(--border);border-left:4px solid var(--ok);border-radius:8px;padding:1em 1.2em;margin-bottom:1.5em">
-  <strong style="color:var(--text-strong)">✅ 本機 server 已開</strong>
+  <strong style="color:var(--text-strong)">本機 server 已開</strong>
   <span class="muted" id="backend-up-version"></span>
   <div style="margin-top:0.75em">
     <a href="./app.html" style="display:inline-block;background:var(--accent);color:#0f172a;font-weight:600;padding:0.6em 1.2em;border-radius:6px;text-decoration:none">
@@ -27,11 +27,11 @@
 </div>
 
 <section class="cta">
-  <h2 style="margin-top:0;border:0;padding:0;font-size:1.2em">📦 一行裝起</h2>
+  <h2 style="margin-top:0;border:0;padding:0;font-size:1.2em">一行裝起</h2>
 
   <div class="os-tabs" role="tablist">
-    <button class="os-tab" data-os="mac" type="button" role="tab">🍎 macOS</button>
-    <button class="os-tab" data-os="windows" type="button" role="tab">🪟 Windows</button>
+    <button class="os-tab" data-os="mac" type="button" role="tab">macOS</button>
+    <button class="os-tab" data-os="windows" type="button" role="tab">Windows</button>
   </div>
 
   <div class="os-panel" data-os="mac">
@@ -64,14 +64,14 @@
 <ul class="features">
   <li><strong>📚 Convert</strong> — EPUB ↔ MOBI ↔ AZW3，順便做 zh-CN ↔ zh-TW ↔ zh-HK 變體轉換（OpenCC + 可選 LLM 兜底）。</li>
   <li><strong>🔍 Diff</strong> — Side-by-side 原文 / 轉換後對照 HTML 報告。</li>
-  <li><strong>📦 Export Skill</strong> — 將本書整成 Claude Skill folder（SKILL.md + JSONL knowledge base），一鍵裝去 <code>~/.claude/skills/</code>，Claude 之後可以基於書嘅實際內容答你問題。</li>
+  <li><strong>Export Skill</strong> — 將本書整成 Claude Skill folder（SKILL.md + JSONL knowledge base），一鍵裝去 <code>~/.claude/skills/</code>，Claude 之後可以基於書嘅實際內容答你問題。</li>
   <li><strong>🧠 Summary</strong> — 一鍵 AI 撮要（一句話總結 / 主要人物 / 主題 / 章節摘要 / 每章啟發），用 banana2556 或 Gemini，可以 download PDF。</li>
 </ul>
 
 <h2>點解 local-first</h2>
 <ul class="steps">
   <li><strong>EPUB 同 API key 永遠留喺你機</strong> — 呢個 landing page 喺 Cloudflare 上面，但所有 processing 都喺你嘅 <code>127.0.0.1</code>，零 traffic 經過 Cloudflare 或者我哋 server。</li>
-  <li><strong>API key 入 localStorage</strong>，唔會出去 server 外。你可以喺 ⚙ Settings tab 即時 test 條 key 對 banana2556 啱唔啱。</li>
+  <li><strong>API key 入 localStorage</strong>，唔會出去 server 外。你可以喺 Settings tab 即時 test 條 key 對 banana2556 啱唔啱。</li>
   <li><strong>所有 LLM 結果 cache 落 disk</strong> — 中途斷網 / cancel / crash 重 run 嗰陣，已完成嘅 batch 0 token reuse，唔會洗多次錢。</li>
   <li><strong>離線都用到</strong>（除咗 LLM Summary 一定要 API）。</li>
 </ul>
@@ -80,8 +80,8 @@
 <ol class="steps">
   <li>Finder 入面雙撃 <code>~/Apps/epubconv/launch.command</code>（或者裝完 script 已經幫你開咗）。</li>
   <li>Terminal 自動跑 server，瀏覽器自動開 <code>http://127.0.0.1:8000</code>。</li>
-  <li>第一次入 ⚙ Settings tab paste 你嘅 <code>BANANA2556_API_KEY</code> → Save to browser。</li>
-  <li>之後用 Convert / Diff / Skill / Summary。Header 個 <code>↻ Update &amp; Relaunch</code> 掣等於 <code>git pull</code> + 重啟 server。</li>
+  <li>第一次入 Settings tab paste 你嘅 <code>BANANA2556_API_KEY</code> → Save to browser。</li>
+  <li>之後用 Convert / Diff / Skill / Summary。Header 個 <code>Update &amp; Relaunch</code> 掣等於 <code>git pull</code> + 重啟 server。</li>
 </ol>
 
 <h2>移除</h2>
