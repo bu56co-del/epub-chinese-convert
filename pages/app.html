@@ -156,6 +156,13 @@
       Or paste this in Windows PowerShell:<br>
       <span class="install-cmd" id="install-cmd-win">iwr -useb https://epub-chinese-convert.pages.dev/install.ps1 | iex</span>
     </p>
+    <p style="margin-top:1.5em" class="muted">
+      Already installed? &nbsp;
+      <button type="button" id="mark-installed"
+              style="background:none;border:0;color:var(--accent);cursor:pointer;padding:0;font-size:inherit;text-decoration:underline">
+        Set my launcher path instead →
+      </button>
+    </p>
   </div>
 
   <!-- Returning users: their server was up before, just needs to be re-started. -->
@@ -198,6 +205,13 @@
         Or just double-click <code id="launch-cmd-filename"></code> in Finder.
       </p>
     </div>
+    <p style="margin-top:1.5em" class="muted">
+      Haven't actually installed yet? &nbsp;
+      <button type="button" id="mark-not-installed"
+              style="background:none;border:0;color:var(--accent);cursor:pointer;padding:0;font-size:inherit;text-decoration:underline">
+        Show me the install command →
+      </button>
+    </p>
   </div>
 
   <p style="margin-top:1.5em" class="muted">
@@ -982,6 +996,22 @@
       el.style.display = hasInstalled ? "" : "none";
     });
   }
+
+  // Manual toggles between the two overlay panels — user knows their state
+  // better than we do (they may have a launch.command from a previous
+  // session that this browser has never seen running).
+  document.getElementById("mark-installed").addEventListener("click", () => {
+    localStorage.setItem(HAS_INSTALLED_KEY, "1");
+    updateOverlayMode();
+    renderLaunchCmd();
+    // Focus the path input so the user can paste right away.
+    const input = document.getElementById("launch-path-input");
+    if (input) { input.focus(); }
+  });
+  document.getElementById("mark-not-installed").addEventListener("click", () => {
+    localStorage.removeItem(HAS_INSTALLED_KEY);
+    updateOverlayMode();
+  });
 
   function startProbeLoop() {
     if (probePollHandle) return;
