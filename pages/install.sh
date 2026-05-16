@@ -55,13 +55,35 @@ esac
 # 1. Homebrew (macOS only)
 if [[ "$OS" == "Darwin" ]]; then
     if ! command -v brew >/dev/null 2>&1; then
-        red "Homebrew is required on macOS but not found."
-        echo  "Install it once with the official one-liner:"
-        echo  "  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-        echo  "Then re-run this installer."
-        exit 1
+        yellow "Homebrew is not installed."
+        if ask_yes_no "Install Homebrew now (the official one-liner)? [Y/n]" "Y"; then
+            step "Running Homebrew's official installer… (takes ~5 min, will ask for your password)"
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            # Pick the right prefix per architecture and bring brew onto PATH
+            # for the rest of this script.
+            if [[ "$(uname -m)" == "arm64" ]]; then
+                BREW_PREFIX="/opt/homebrew"
+            else
+                BREW_PREFIX="/usr/local"
+            fi
+            if [[ -x "$BREW_PREFIX/bin/brew" ]]; then
+                eval "$($BREW_PREFIX/bin/brew shellenv)"
+            fi
+            if ! command -v brew >/dev/null 2>&1; then
+                red "Homebrew install finished but 'brew' isn't on PATH."
+                echo  "Open a new Terminal window and re-run this installer."
+                exit 1
+            fi
+            green "Homebrew is installed."
+        else
+            red "Aborting — Homebrew is required on macOS."
+            echo  "You can install it manually later:"
+            echo  '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+            exit 1
+        fi
+    else
+        step "Homebrew is installed."
     fi
-    step "Homebrew is installed."
 fi
 
 # 2. Python 3.10+

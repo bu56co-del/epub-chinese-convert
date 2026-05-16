@@ -75,6 +75,32 @@ code {
   margin: 2em 0;
 }
 
+.os-tabs {
+  display: flex;
+  gap: 0.25em;
+  margin: 1em 0 1em;
+  border-bottom: 2px solid var(--border);
+}
+
+.os-tab {
+  background: none;
+  border: 0;
+  padding: 0.5em 1em;
+  cursor: pointer;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  font-size: 0.95em;
+}
+
+.os-tab:hover { color: var(--accent-hover); }
+
+.os-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
 .cta .install-row {
   display: flex;
   align-items: stretch;

@@ -17,16 +17,37 @@
 </header>
 
 <section class="cta">
-  <h2 style="margin-top:0;border:0;padding:0;font-size:1.2em">📦 一行裝起（macOS）</h2>
-  <p class="muted">Paste 落 Terminal 即裝。需要 <a href="https://brew.sh" target="_blank">Homebrew</a>（事先裝好）。</p>
-  <div class="install-row">
-    <code class="install-cmd" id="install-cmd">curl -fsSL …/install.sh | bash</code>
-    <button class="copy" id="copy-btn" type="button">Copy</button>
+  <h2 style="margin-top:0;border:0;padding:0;font-size:1.2em">📦 一行裝起</h2>
+
+  <div class="os-tabs" role="tablist">
+    <button class="os-tab" data-os="mac" type="button" role="tab">🍎 macOS</button>
+    <button class="os-tab" data-os="windows" type="button" role="tab">🪟 Windows</button>
   </div>
-  <p class="muted" style="margin-top:0.75em">
-    Script 會：clone repo → 整 venv → pip install → 開 launcher → 自動跳去 <code>http://127.0.0.1:8000</code>。
-    可選裝 Calibre（MOBI / AZW3 用）。
-  </p>
+
+  <div class="os-panel" data-os="mac">
+    <p class="muted">Paste 落 Terminal 即裝。冇 Homebrew 嘅話 script 會問你要唔要自動裝。</p>
+    <div class="install-row">
+      <code class="install-cmd" id="install-cmd-mac">curl -fsSL …/install.sh | bash</code>
+      <button class="copy" data-target="install-cmd-mac" type="button">Copy</button>
+    </div>
+    <p class="muted" style="margin-top:0.75em">
+      Script 會：（必要時裝 Homebrew）→ clone repo → 整 venv → pip install → 開 <code>launch.command</code> →
+      自動跳去 <code>http://127.0.0.1:8000</code>。可選裝 Calibre（MOBI / AZW3 用）。
+    </p>
+  </div>
+
+  <div class="os-panel" data-os="windows" style="display:none">
+    <p class="muted">Paste 落 PowerShell 即裝。需要 Windows 10 1809+ / Windows 11（內建 winget）。</p>
+    <div class="install-row">
+      <code class="install-cmd" id="install-cmd-win">iwr -useb …/install.ps1 | iex</code>
+      <button class="copy" data-target="install-cmd-win" type="button">Copy</button>
+    </div>
+    <p class="muted" style="margin-top:0.75em">
+      Script 會：winget install Git + Python 3.11 → clone repo → 整 venv → pip install → 開
+      <code>launch.bat</code> → 自動跳去 <code>http://127.0.0.1:8000</code>。
+      可選裝 Calibre（MOBI / AZW3 用）。
+    </p>
+  </div>
 </section>
 
 <h2>係咩</h2>
@@ -55,8 +76,15 @@
 
 <h2>移除</h2>
 <p>一行 uninstall（保留 cached LLM 結果）：</p>
-<code class="install-cmd" id="uninstall-cmd" style="display:block;white-space:nowrap">curl -fsSL …/uninstall.sh | bash</code>
-<p class="muted">完全清埋 cache + saved settings 加 <code>-s -- --purge</code>。</p>
+<div class="os-panel" data-os="mac">
+  <code class="install-cmd" id="uninstall-cmd-mac" style="display:block;white-space:nowrap">curl -fsSL …/uninstall.sh | bash</code>
+  <p class="muted">完全清埋 cache + saved settings 加 <code>-s -- --purge</code>。</p>
+</div>
+<div class="os-panel" data-os="windows" style="display:none">
+  <p class="muted">Windows 暫時手動 — 喺 PowerShell 跑：</p>
+  <code class="install-cmd" style="display:block;white-space:nowrap">Remove-Item -Recurse "$env:USERPROFILE\Apps\epubconv"</code>
+  <p class="muted">完全清埋 cache 仲要加 <code>Remove-Item -Recurse "$env:USERPROFILE\.config\epubconv"</code>。</p>
+</div>
 
 <footer>
   <p>
@@ -68,31 +96,63 @@
 
 <script>
 (function () {
-  // Build curl commands relative to whichever origin served this page so
-  // the same HTML works on *.pages.dev, a custom domain, or local preview.
+  // Build install / uninstall commands relative to whichever origin served
+  // this page so the same HTML works on *.pages.dev, a custom domain, or
+  // a local preview.
   const origin = window.location.origin || "";
-  const cmd = origin + "/install.sh";
-  const ucmd = origin + "/uninstall.sh";
-  const installEl = document.getElementById("install-cmd");
-  const uninstallEl = document.getElementById("uninstall-cmd");
-  if (origin && !origin.startsWith("file:")) {
-    installEl.textContent = `curl -fsSL ${cmd} | bash`;
-    uninstallEl.textContent = `curl -fsSL ${ucmd} | bash`;
+  const isHttp = origin && !origin.startsWith("file:");
+
+  if (isHttp) {
+    document.getElementById("install-cmd-mac").textContent =
+      `curl -fsSL ${origin}/install.sh | bash`;
+    document.getElementById("install-cmd-win").textContent =
+      `iwr -useb ${origin}/install.ps1 | iex`;
+    document.getElementById("uninstall-cmd-mac").textContent =
+      `curl -fsSL ${origin}/uninstall.sh | bash`;
   }
 
-  const btn = document.getElementById("copy-btn");
-  btn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(installEl.textContent.trim());
-      btn.textContent = "Copied!";
-      btn.classList.add("copied");
-      setTimeout(() => {
-        btn.textContent = "Copy";
-        btn.classList.remove("copied");
-      }, 1800);
-    } catch (e) {
-      btn.textContent = "Copy failed";
-    }
+  // -------- OS tabs --------
+  function showOS(os) {
+    document.querySelectorAll(".os-tab").forEach(b => {
+      b.classList.toggle("active", b.dataset.os === os);
+    });
+    document.querySelectorAll(".os-panel").forEach(p => {
+      p.style.display = (p.dataset.os === os) ? "block" : "none";
+    });
+    try { localStorage.setItem("epubconv:landing-os", os); } catch (e) {}
+  }
+
+  document.querySelectorAll(".os-tab").forEach(btn => {
+    btn.addEventListener("click", () => showOS(btn.dataset.os));
+  });
+
+  // Default tab: saved choice → user-agent guess → mac.
+  let defaultOS = "mac";
+  try {
+    const saved = localStorage.getItem("epubconv:landing-os");
+    if (saved === "mac" || saved === "windows") defaultOS = saved;
+    else if (/Windows/i.test(navigator.userAgent)) defaultOS = "windows";
+  } catch (e) { /* private mode */ }
+  showOS(defaultOS);
+
+  // -------- Copy buttons --------
+  document.querySelectorAll("button.copy").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const targetId = btn.dataset.target;
+      const el = document.getElementById(targetId);
+      if (!el) return;
+      try {
+        await navigator.clipboard.writeText(el.textContent.trim());
+        btn.textContent = "Copied!";
+        btn.classList.add("copied");
+        setTimeout(() => {
+          btn.textContent = "Copy";
+          btn.classList.remove("copied");
+        }, 1800);
+      } catch (e) {
+        btn.textContent = "Copy failed";
+      }
+    });
   });
 })();
 </script>
