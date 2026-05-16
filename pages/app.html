@@ -816,7 +816,7 @@
 
   // -------- Tiny inline markdown renderer --------
   function simpleMarkdown(s) {
-    function esc(t) { return t.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",""":"&quot;"}[c])); }
+    function esc(t) { return t.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
     const lines = s.split(/\r?\n/);
     const out = [];
     let inUl = false;
