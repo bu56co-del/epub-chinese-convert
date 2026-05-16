@@ -137,21 +137,58 @@
 <div id="install-overlay" class="install-overlay" style="display:none">
   <h1>epubconv</h1>
   <p>Local backend not detected at <code>http://127.0.0.1:8000</code>.</p>
-  <p>Install + launch the local app on your Mac to start using this UI:</p>
-  <div>
-    <span class="install-cmd" id="install-cmd-text">curl -fsSL https://epub-chinese-convert.pages.dev/install.sh | bash</span>
-    <button type="button" class="copy" id="install-copy">Copy</button>
+  <p class="muted" style="margin-top:-0.5em">
+    Probing every 3s — page will switch to the app automatically once the
+    server comes online.
+  </p>
+
+  <!-- First-time users: show the install command. -->
+  <div class="overlay-not-installed">
+    <p style="margin-top:1.5em">Install + launch the local app to start using this UI:</p>
+    <div>
+      <span class="install-cmd" id="install-cmd-text">curl -fsSL https://epub-chinese-convert.pages.dev/install.sh | bash</span>
+      <button type="button" class="copy" id="install-copy">Copy</button>
+    </div>
+    <p style="margin-top:1.5em">
+      Or paste this in Windows PowerShell:<br>
+      <span class="install-cmd" id="install-cmd-win">iwr -useb https://epub-chinese-convert.pages.dev/install.ps1 | iex</span>
+    </p>
   </div>
-  <p style="margin-top:1.5em">
-    Or paste this in Windows PowerShell:<br>
-    <span class="install-cmd" id="install-cmd-win">iwr -useb https://epub-chinese-convert.pages.dev/install.ps1 | iex</span>
-  </p>
+
+  <!-- Returning users: their server was up before, just needs to be re-started. -->
+  <div class="overlay-not-running" style="display:none">
+    <p style="margin-top:1.5em">
+      Your local server isn't running. Double-click your launcher in
+      Finder / Explorer, or paste this into a terminal:
+    </p>
+    <div>
+      <span class="install-cmd" id="launch-cmd">open ~/Apps/epubconv/launch.command</span>
+      <button type="button" class="copy" id="launch-copy">Copy</button>
+    </div>
+    <p style="margin-top:0.8em" class="muted">
+      Saved launcher path:
+      <span id="saved-launch-path" style="color:var(--text-strong)">(none yet)</span>
+      <button type="button" id="edit-launch-path"
+              style="background:none;border:0;color:var(--accent);cursor:pointer;padding:0;font-size:inherit;text-decoration:underline">
+        change
+      </button>
+    </p>
+    <div id="edit-launch-path-row" style="display:none;margin-top:0.5em">
+      <input type="text" id="launch-path-input"
+             placeholder="/Users/yakafung/Apps/epubconv/launch.command"
+             style="width:80%;padding:0.5em;background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,monospace;font-size:0.9em">
+      <button type="button" id="save-launch-path"
+              style="background:var(--accent);color:#0f172a;border:0;border-radius:6px;padding:0.5em 1em;cursor:pointer;font-weight:600">
+        Save
+      </button>
+    </div>
+  </div>
+
   <p style="margin-top:1.5em" class="muted">
-    Already installed? Make sure <code>launch.command</code> (macOS) or
-    <code>launch.bat</code> (Windows) is running, then
-    <a href="#" id="retry-probe" style="color:var(--accent)">retry the probe</a>.
+    <a href="#" id="retry-probe" style="color:var(--accent)">Retry now</a>
+    &nbsp;|&nbsp;
+    <a href="https://epub-chinese-convert.pages.dev/" style="color:var(--accent)">← Back to landing page</a>
   </p>
-  <p style="margin-top:0.5em"><a href="https://epub-chinese-convert.pages.dev/" style="color:var(--accent)">← Back to landing page</a></p>
 </div>
 <div id="app-shell">
   <div class="app-banner" id="backend-banner">
@@ -822,16 +859,115 @@
     e.preventDefault();
     await showAppOrInstall();
   });
-  async function showAppOrInstall() {
+
+  // Once we've ever seen the backend up, we know epubconv is installed.
+  // From then on, the overlay's "first install" instructions become
+  // "your server isn't running — open launch.command" instead.
+  const HAS_INSTALLED_KEY = "epubconv:has-installed";
+  const LAUNCH_PATH_KEY = "epubconv:launch-path";
+  const LAUNCH_PLATFORM_KEY = "epubconv:launch-platform";
+  let probePollHandle = null;
+
+  function renderLaunchCmd() {
+    const path = localStorage.getItem(LAUNCH_PATH_KEY) || "";
+    const plat = localStorage.getItem(LAUNCH_PLATFORM_KEY) || "";
+    const cmdEl = document.getElementById("launch-cmd");
+    const savedEl = document.getElementById("saved-launch-path");
+    if (path) {
+      const isWin = plat.startsWith("win") || path.toLowerCase().endsWith(".bat");
+      cmdEl.textContent = isWin
+        ? `start "" "${path}"`
+        : `open "${path}"`;
+      savedEl.textContent = path;
+      savedEl.style.color = "var(--text-strong)";
+    } else {
+      cmdEl.textContent = "open ~/Apps/epubconv/launch.command";
+      savedEl.textContent = "(none yet — auto-saves on first successful connection)";
+      savedEl.style.color = "var(--text-muted)";
+    }
+  }
+
+  document.getElementById("launch-copy").addEventListener("click", async () => {
+    try {
+      const el = document.getElementById("launch-cmd");
+      await navigator.clipboard.writeText(el.textContent.trim());
+      const btn = document.getElementById("launch-copy");
+      btn.textContent = "Copied!";
+      btn.classList.add("copied");
+      setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1500);
+    } catch (e) {}
+  });
+
+  document.getElementById("edit-launch-path").addEventListener("click", () => {
+    const row = document.getElementById("edit-launch-path-row");
+    row.style.display = row.style.display === "none" ? "block" : "none";
+    if (row.style.display === "block") {
+      const input = document.getElementById("launch-path-input");
+      input.value = localStorage.getItem(LAUNCH_PATH_KEY) || "";
+      input.focus();
+    }
+  });
+
+  document.getElementById("save-launch-path").addEventListener("click", () => {
+    const input = document.getElementById("launch-path-input");
+    const value = input.value.trim();
+    if (value) {
+      localStorage.setItem(LAUNCH_PATH_KEY, value);
+      // Heuristic platform tag from the path itself.
+      localStorage.setItem(
+        LAUNCH_PLATFORM_KEY,
+        value.toLowerCase().endsWith(".bat") ? "win32" : "darwin",
+      );
+    } else {
+      localStorage.removeItem(LAUNCH_PATH_KEY);
+      localStorage.removeItem(LAUNCH_PLATFORM_KEY);
+    }
+    document.getElementById("edit-launch-path-row").style.display = "none";
+    renderLaunchCmd();
+  });
+
+  function updateOverlayMode() {
+    const hasInstalled = localStorage.getItem(HAS_INSTALLED_KEY) === "1";
+    document.querySelectorAll(".overlay-not-installed").forEach(el => {
+      el.style.display = hasInstalled ? "none" : "";
+    });
+    document.querySelectorAll(".overlay-not-running").forEach(el => {
+      el.style.display = hasInstalled ? "" : "none";
+    });
+  }
+
+  function startProbeLoop() {
+    if (probePollHandle) return;
+    probePollHandle = setInterval(async () => {
+      const ok = await showAppOrInstall(/*silent=*/true);
+      if (ok) {
+        clearInterval(probePollHandle);
+        probePollHandle = null;
+      }
+    }, 3000);
+  }
+
+  async function showAppOrInstall(silent) {
     const health = await probeBackend();
     if (health && health.ok) {
       backendVersion.textContent = "(" + (health.version || "?") + ")";
       installOverlay.style.display = "none";
       appShell.style.display = "block";
+      localStorage.setItem(HAS_INSTALLED_KEY, "1");
+      // Remember exactly which launcher to recommend if the server stops.
+      if (health.launch_path) {
+        localStorage.setItem(LAUNCH_PATH_KEY, health.launch_path);
+      }
+      if (health.platform) {
+        localStorage.setItem(LAUNCH_PLATFORM_KEY, health.platform);
+      }
       return true;
     } else {
       installOverlay.style.display = "block";
       appShell.style.display = "none";
+      updateOverlayMode();
+      renderLaunchCmd();
+      startProbeLoop();
       return false;
     }
   }
