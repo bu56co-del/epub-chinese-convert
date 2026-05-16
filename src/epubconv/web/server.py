@@ -879,6 +879,19 @@ def create_app() -> FastAPI:
         expose_headers=["Content-Disposition"],
     )
 
+    # Chrome's Private Network Access (PNA) requires public HTTPS pages to
+    # get explicit consent from a localhost server before fetching it. When
+    # the browser sends `Access-Control-Request-Private-Network: true` on
+    # a preflight, we must echo back `Access-Control-Allow-Private-Network:
+    # true` or the fetch fails silently. Starlette's CORSMiddleware doesn't
+    # know about this header, so we tack it on ourselves.
+    @app.middleware("http")
+    async def allow_private_network(request, call_next):
+        response = await call_next(request)
+        if request.headers.get("access-control-request-private-network", "").lower() == "true":
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
     # CSRF defense: every state-changing request that comes from a *browser*
     # carries an Origin header. We reject the request unless that origin is
     # in our allow-list. Curl / scripts / same-origin requests omit the

@@ -136,10 +136,13 @@
 
 <div id="install-overlay" class="install-overlay" style="display:none">
   <h1>epubconv</h1>
-  <p>Local backend not detected at <code>http://127.0.0.1:8000</code>.</p>
+  <p>Local backend not detected at <code id="probe-target">http://127.0.0.1:8000</code>.</p>
   <p class="muted" style="margin-top:-0.5em">
     Probing every 3s — page will switch to the app automatically once the
     server comes online.
+  </p>
+  <p class="muted" id="probe-error-line" style="margin-top:0.3em;display:none;font-family:ui-monospace,monospace;font-size:0.82em;color:var(--error)">
+    Last probe error: <span id="probe-error-detail"></span>
   </p>
 
   <!-- First-time users: show the install command. -->
@@ -379,15 +382,28 @@
     ? ""
     : "http://127.0.0.1:8000";
 
+  // Last probe error surface so the overlay can show a useful diagnostic
+  // instead of a generic "install" prompt when something specific is wrong.
+  let lastProbeError = null;
+
   async function probeBackend() {
+    lastProbeError = null;
     try {
       const r = await fetch(BACKEND + "/healthz", {
         cache: "no-store",
         signal: AbortSignal.timeout(3000),
       });
-      if (!r.ok) return null;
+      if (!r.ok) {
+        lastProbeError = `HTTP ${r.status} ${r.statusText}`;
+        return null;
+      }
       return await r.json();
     } catch (e) {
+      // Common cases:
+      //   TypeError "Failed to fetch"  → server down / port wrong / blocked
+      //   TimeoutError                  → reachable but slow / hung
+      //   AbortError                    → 3s timeout fired
+      lastProbeError = (e && (e.message || e.name)) || String(e);
       return null;
     }
   }
@@ -999,6 +1015,12 @@
       appShell.style.display = "none";
       updateOverlayMode();
       renderLaunchCmd();
+      const errLine = document.getElementById("probe-error-line");
+      const errDetail = document.getElementById("probe-error-detail");
+      if (lastProbeError && errLine && errDetail) {
+        errDetail.textContent = lastProbeError;
+        errLine.style.display = "block";
+      }
       startProbeLoop();
       return false;
     }
