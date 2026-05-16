@@ -1,60 +1,8 @@
-"""FastAPI server for browser-based EPUB conversion + skill export + summary.
-
-Runs locally; no auth, no persistence. Designed to be opened by
-double-clicking ``launch.command`` (which runs ``epubconv serve --reload``).
-
-Tabs: Convert / Diff / Skill / Summary / Settings. A header "Update &
-Relaunch" button runs ``git pull`` + ``pip install`` and triggers the
-``--reload`` watcher to restart the server with the new code; the
-browser tab refreshes itself on completion.
-
-Optional dependency: install with ``pip install epubconv[web]``.
-"""
-from __future__ import annotations
-
-import asyncio
-import json
-import os
-import shutil
-import ssl
-import subprocess
-import sys
-import tempfile
-import threading
-import zipfile
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-
-try:
-    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "fastapi is required. Install with: pip install epubconv[web]"
-    ) from exc
-
-from loguru import logger
-
-from ..converters.writing_mode import WRITING_MODES
-from ..diff import build_diff_report
-from ..engines.registry import get_engine, list_engines
-from ..llm.client import PROVIDERS, provider_base_url
-from ..formats.calibre import (
-    OUTPUT_FORMATS as EBOOK_OUTPUT_FORMATS,
-    CalibreNotFoundError,
-    detect_format as detect_ebook_format,
-)
-from ..pipeline import convert_ebook, convert_epub
-from ..skill.exporter import export_skill
-from ..summarize import SummaryCancelled, SummaryError, summarise_epub
-
-INDEX_HTML = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>epubconv</title>
+<title>epubconv (web)</title>
 <style>
   :root {
     --bg: #0f172a;
@@ -135,8 +83,82 @@ INDEX_HTML = """<!DOCTYPE html>
     #print-container code { background: #f0f0f0; }
   }
 </style>
+
+<style>
+  .install-overlay {
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 3em 1.5em;
+    text-align: center;
+  }
+  .install-overlay h1 { color: var(--text-strong); margin-bottom: 0.3em; }
+  .install-overlay .install-cmd {
+    display: inline-block;
+    background: var(--code-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75em 1em;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.9em;
+    margin: 1em 0;
+    text-align: left;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .install-overlay .copy {
+    background: var(--accent);
+    color: #0f172a;
+    border: 0;
+    border-radius: 6px;
+    padding: 0.5em 1em;
+    cursor: pointer;
+    font-weight: 600;
+    margin-left: 0.5em;
+  }
+  .install-overlay .copy.copied { background: var(--ok); }
+  #app-shell { display: none; }
+  .app-banner {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5em 0.8em;
+    margin-bottom: 1em;
+    font-size: 0.85em;
+    color: var(--text-muted);
+  }
+  .app-banner.warn { border-color: #f87171; color: #fca5a5; }
+</style>
+
 </head>
 <body>
+
+<div id="install-overlay" class="install-overlay" style="display:none">
+  <h1>epubconv</h1>
+  <p>Local backend not detected at <code>http://127.0.0.1:8000</code>.</p>
+  <p>Install + launch the local app on your Mac to start using this UI:</p>
+  <div>
+    <span class="install-cmd" id="install-cmd-text">curl -fsSL https://epub-chinese-convert.pages.dev/install.sh | bash</span>
+    <button type="button" class="copy" id="install-copy">Copy</button>
+  </div>
+  <p style="margin-top:1.5em">
+    Or paste this in Windows PowerShell:<br>
+    <span class="install-cmd" id="install-cmd-win">iwr -useb https://epub-chinese-convert.pages.dev/install.ps1 | iex</span>
+  </p>
+  <p style="margin-top:1.5em" class="muted">
+    Already installed? Make sure <code>launch.command</code> (macOS) or
+    <code>launch.bat</code> (Windows) is running, then
+    <a href="#" id="retry-probe" style="color:var(--accent)">retry the probe</a>.
+  </p>
+  <p style="margin-top:0.5em"><a href="https://epub-chinese-convert.pages.dev/" style="color:var(--accent)">← Back to landing page</a></p>
+</div>
+<div id="app-shell">
+  <div class="app-banner" id="backend-banner">
+    Connected to local backend <span id="backend-version" style="color:var(--text-strong)"></span>
+    at <code>http://127.0.0.1:8000</code>.
+  </div>
+
 <header>
   <h1>epubconv</h1>
   <div>
@@ -154,7 +176,7 @@ INDEX_HTML = """<!DOCTYPE html>
 </div>
 
 <section id="t-convert" class="panel active">
-<form id="f-convert" enctype="multipart/form-data" action="/convert" method="post">
+<form id="f-convert" enctype="multipart/form-data">
   <h3>Convert ebook between Chinese variants & formats</h3>
   <p class="muted">Input may be EPUB / MOBI / AZW3 (Kindle). Cross-format conversion uses Calibre's
     <code>ebook-convert</code> (install <a href="https://calibre-ebook.com" target="_blank">Calibre</a>
@@ -184,7 +206,7 @@ INDEX_HTML = """<!DOCTYPE html>
 </section>
 
 <section id="t-diff" class="panel">
-<form id="f-diff" enctype="multipart/form-data" action="/diff" method="post">
+<form id="f-diff" enctype="multipart/form-data">
   <h3>Side-by-side diff preview</h3>
   <label>EPUB <input type="file" name="file" accept=".epub" required></label>
   <div class="row">
@@ -300,6 +322,26 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <script>
 (function() {
+  // BACKEND is the origin of the local FastAPI server. When this page is
+  // served by the backend itself (http://127.0.0.1:8000/), we use relative
+  // paths. When it's served from Cloudflare Pages, we point at localhost.
+  const BACKEND = (location.hostname === "127.0.0.1" || location.hostname === "localhost")
+    ? ""
+    : "http://127.0.0.1:8000";
+
+  async function probeBackend() {
+    try {
+      const r = await fetch(BACKEND + "/healthz", {
+        cache: "no-store",
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch (e) {
+      return null;
+    }
+  }
+
   // -------- Local API-key storage --------
   const KEY_NAMES = ["BANANA2556_API_KEY", "GEMINI_API_KEY"];
   function getKey(name) { return localStorage.getItem("epubconv:" + name) || ""; }
@@ -340,7 +382,7 @@ INDEX_HTML = """<!DOCTYPE html>
     updateStatus.textContent = "Pulling…";
     let data;
     try {
-      const r = await fetch("/update", { method: "POST" });
+      const r = await fetch(BACKEND + "/update", { method: "POST" });
       data = await r.json();
       if (!r.ok) {
         updateStatus.textContent = "Error: " + (data.detail || r.statusText);
@@ -385,7 +427,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   document.getElementById("btn-skill-download").addEventListener("click", async () => {
     showSkill("Generating skill…", false);
-    const r = await fetch("/export-skill", { method: "POST", body: new FormData(skillForm) });
+    const r = await fetch(BACKEND + "/export-skill", { method: "POST", body: new FormData(skillForm) });
     if (!r.ok) { showSkill("Error: " + (await r.text()), true); return; }
     const blob = await r.blob();
     const cd = r.headers.get("content-disposition") || "";
@@ -399,12 +441,12 @@ INDEX_HTML = """<!DOCTYPE html>
   });
   document.getElementById("btn-skill-install").addEventListener("click", async () => {
     showSkill("Installing to ~/.claude/skills/ …", false);
-    const r = await fetch("/install-skill", { method: "POST", body: new FormData(skillForm) });
+    const r = await fetch(BACKEND + "/install-skill", { method: "POST", body: new FormData(skillForm) });
     const data = await r.json().catch(() => null);
     if (!r.ok) { showSkill("Error: " + (data ? data.detail : r.statusText), true); return; }
     showSkill(
-      "Installed!\\nPath: " + data.path + "\\nChunks: " + data.chunks +
-      "\\n\\nRestart Claude Code (or open a new session) to pick up the skill.",
+      "Installed!\nPath: " + data.path + "\nChunks: " + data.chunks +
+      "\n\nRestart Claude Code (or open a new session) to pick up the skill.",
       false
     );
   });
@@ -440,7 +482,7 @@ INDEX_HTML = """<!DOCTYPE html>
     cancelBtn.disabled = true;
     cancelBtn.textContent = "Cancelling…";
     try {
-      await fetch("/summarize-cancel", { method: "POST" });
+      await fetch(BACKEND + "/summarize-cancel", { method: "POST" });
     } catch (e) {
       summaryStatus.textContent = "Cancel request failed: " + e;
     }
@@ -527,7 +569,7 @@ INDEX_HTML = """<!DOCTYPE html>
     while (true) {
       let r;
       try {
-        r = await fetch("/summarize-stream", { cache: "no-store" });
+        r = await fetch(BACKEND + "/summarize-stream", { cache: "no-store" });
       } catch (e) {
         // Network error — back off and retry.
         summaryProgressText.textContent =
@@ -556,7 +598,7 @@ INDEX_HTML = """<!DOCTYPE html>
         }
         if (chunk.done) break;
         buf += decoder.decode(chunk.value, { stream: true });
-        let parts = buf.split("\\n\\n");
+        let parts = buf.split("\n\n");
         buf = parts.pop();
         for (const part of parts) {
           const line = part.trim();
@@ -600,7 +642,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     let r;
     try {
-      r = await fetch("/summarize", { method: "POST", body: fd });
+      r = await fetch(BACKEND + "/summarize", { method: "POST", body: fd });
     } catch (e) {
       summaryStatus.textContent = "Network error: " + e;
       summaryProgress.style.display = "none";
@@ -626,7 +668,7 @@ INDEX_HTML = """<!DOCTYPE html>
   // just finished and we never saw the result), auto-attach to replay.
   (async () => {
     try {
-      const r = await fetch("/summarize-status", { cache: "no-store" });
+      const r = await fetch(BACKEND + "/summarize-status", { cache: "no-store" });
       if (!r.ok) return;
       const s = await r.json();
       if (s.active || s.has_result) {
@@ -700,7 +742,7 @@ INDEX_HTML = """<!DOCTYPE html>
       fd.append("provider", provider);
       fd.append("api_key", key);
       try {
-        const r = await fetch("/test-key", { method: "POST", body: fd });
+        const r = await fetch(BACKEND + "/test-key", { method: "POST", body: fd });
         const d = await r.json();
         if (d.ok) {
           lines.push(`${provider}: ✓ ${d.message}`);
@@ -711,7 +753,7 @@ INDEX_HTML = """<!DOCTYPE html>
         lines.push(`${provider}: ✗ network error: ${e}`);
       }
     }
-    showSettings(lines.join("\\n"));
+    showSettings(lines.join("\n"));
   });
 
   function showSettings(text) {
@@ -724,8 +766,8 @@ INDEX_HTML = """<!DOCTYPE html>
 
   // -------- Tiny inline markdown renderer --------
   function simpleMarkdown(s) {
-    function esc(t) { return t.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c])); }
-    const lines = s.split(/\\r?\\n/);
+    function esc(t) { return t.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",""":"&quot;"}[c])); }
+    const lines = s.split(/\r?\n/);
     const out = [];
     let inUl = false;
     for (let raw of lines) {
@@ -747,538 +789,106 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
     if (inUl) out.push("</ul>");
-    return out.join("\\n");
+    return out.join("\n");
   }
   function inline(s) {
     return s
       .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>")
-      .replace(/\\*([^*]+)\\*/g, "<em>$1</em>");
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>");
   }
+
+  // -------- Backend detection + install overlay --------
+  const installOverlay = document.getElementById("install-overlay");
+  const appShell = document.getElementById("app-shell");
+  const backendVersion = document.getElementById("backend-version");
+  const installCmdEl = document.getElementById("install-cmd-text");
+  const installWinEl = document.getElementById("install-cmd-win");
+  const origin = window.location.origin || "https://epub-chinese-convert.pages.dev";
+  if (origin && !origin.startsWith("file:")) {
+    installCmdEl.textContent = `curl -fsSL ${origin}/install.sh | bash`;
+    installWinEl.textContent = `iwr -useb ${origin}/install.ps1 | iex`;
+  }
+  document.getElementById("install-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(installCmdEl.textContent.trim());
+      const btn = document.getElementById("install-copy");
+      btn.textContent = "Copied!";
+      btn.classList.add("copied");
+      setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1500);
+    } catch (e) {}
+  });
+  document.getElementById("retry-probe").addEventListener("click", async (e) => {
+    e.preventDefault();
+    await showAppOrInstall();
+  });
+  async function showAppOrInstall() {
+    const health = await probeBackend();
+    if (health && health.ok) {
+      backendVersion.textContent = "(" + (health.version || "?") + ")";
+      installOverlay.style.display = "none";
+      appShell.style.display = "block";
+      return true;
+    } else {
+      installOverlay.style.display = "block";
+      appShell.style.display = "none";
+      return false;
+    }
+  }
+
+
+  // -------- Convert form (cross-origin: intercept + fetch + blob download) --------
+  const convertForm = document.getElementById("f-convert");
+  convertForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = convertForm.querySelector("button[type=submit]");
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = "Converting…";
+    try {
+      const r = await fetch(BACKEND + "/convert", { method: "POST", body: new FormData(convertForm) });
+      if (!r.ok) {
+        const t = await r.text();
+        alert("Error " + r.status + ": " + t.slice(0, 240));
+        return;
+      }
+      const blob = await r.blob();
+      const cd = r.headers.get("content-disposition") || "";
+      const m = cd.match(/filename="?([^"]+)"?/);
+      const fname = m ? m[1] : "converted.epub";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = fname; a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      btn.disabled = false; btn.textContent = orig;
+    }
+  });
+
+  // -------- Diff form (cross-origin: open report in new tab) --------
+  const diffForm = document.getElementById("f-diff");
+  diffForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = diffForm.querySelector("button[type=submit]");
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = "Rendering…";
+    try {
+      const r = await fetch(BACKEND + "/diff", { method: "POST", body: new FormData(diffForm) });
+      if (!r.ok) {
+        const t = await r.text();
+        alert("Error " + r.status + ": " + t.slice(0, 240));
+        return;
+      }
+      const html = await r.text();
+      const w = window.open("", "_blank");
+      w.document.write(html); w.document.close();
+    } finally {
+      btn.disabled = false; btn.textContent = orig;
+    }
+  });
+
+  // Run initial probe before anything else mounts.
+  showAppOrInstall();
 })();
 </script>
+
+</div>
 </body>
 </html>
-"""
-
-
-async def _build_skill(
-    file: UploadFile,
-    target_lang: str,
-    chunk_size: int,
-    name: str,
-    description: str,
-) -> tuple[Path, Path]:
-    """Save the upload, run export_skill, and return (skill_dir, tmp_dir)."""
-    upload_name = file.filename or "input.epub"
-    tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-skill-"))
-    src = tmp_dir / upload_name
-    src.write_bytes(await file.read())
-    out_dir = tmp_dir / "skill"
-    try:
-        result = export_skill(
-            src,
-            out_dir,
-            target_lang=target_lang,
-            name=name or None,
-            chunk_size=chunk_size,
-            description_override=description or None,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return result.out_dir, tmp_dir
-
-
-def _zip_dir(src_dir: Path, zip_path: Path) -> None:
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in src_dir.rglob("*"):
-            if path.is_file():
-                zf.write(path, src_dir.name + "/" + path.relative_to(src_dir).as_posix())
-
-
-def _git(*args: str, cwd: Path) -> tuple[int, str, str]:
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-
-
-def _check_key(provider: str, api_key: str, *, timeout: float = 15.0) -> dict:
-    """Hit GET <base_url>/models with the given key. Returns a dict that the
-    /test-key endpoint can JSON-encode."""
-    base = provider_base_url(provider).rstrip("/")
-    url = f"{base}/models"
-    req = Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "epubconv/test-key",
-            "Accept": "application/json",
-        },
-    )
-    ctx = ssl.create_default_context()
-    try:
-        with urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read()
-            payload = json.loads(raw.decode("utf-8"))
-            models = payload.get("data") or payload.get("models") or []
-            return {
-                "ok": True,
-                "status": resp.status,
-                "model_count": len(models) if isinstance(models, list) else 0,
-                "message": f"OK — {len(models) if isinstance(models, list) else '?'} models available",
-            }
-    except HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:300]
-        return {"ok": False, "status": e.code, "model_count": 0, "message": body}
-    except (URLError, OSError, json.JSONDecodeError) as e:
-        return {"ok": False, "status": 0, "model_count": 0, "message": f"{type(e).__name__}: {e}"}
-
-
-def _refresh_dependencies(repo_root: Path) -> str:
-    """Run ``pip install -e .[web,llm]`` quietly. Idempotent; ~1-2s when
-    nothing changed. Returns a short log line for the response."""
-    proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "-e", f"{repo_root}[web,llm]"],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if proc.returncode == 0:
-        return "ok"
-    # Don't fail the whole update on pip errors — surface the message but
-    # let the user see the new code is live.
-    return f"pip exited {proc.returncode}: {proc.stderr.strip()[:200]}"
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(title="epubconv", docs_url=None, redoc_url=None)
-    repo_root = Path(__file__).resolve().parents[3]
-
-    # Allow the Cloudflare-hosted UI (and any localhost variant) to fetch
-    # this backend cross-origin. Browsers treat 127.0.0.1 as a "secure
-    # context", so HTTPS pages can talk to it as long as CORS is open.
-    cors_origins = [
-        "http://127.0.0.1:8000",
-        "http://localhost:8000",
-        "https://epub-chinese-convert.pages.dev",
-    ]
-    extra = os.environ.get("EPUBCONV_CORS_ORIGINS", "")
-    if extra:
-        cors_origins.extend(o.strip() for o in extra.split(",") if o.strip())
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_origin_regex=r"https://.*\.pages\.dev$",  # preview deploys
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
-    )
-
-    # On every server start, log the git HEAD so the user can confirm
-    # they're actually running the version they just pulled — diagnoses
-    # "I updated but it's still broken" reports in seconds.
-    try:
-        rc, head, _ = _git("rev-parse", "--short", "HEAD", cwd=repo_root)
-        head_label = head if rc == 0 else "unknown"
-    except Exception:
-        head_label = "no-git"
-    logger.info(f"epubconv server starting on git HEAD = {head_label}")
-
-    @app.get("/healthz")
-    def healthz() -> JSONResponse:
-        """Cheap probe so the Cloudflare UI can detect whether a local
-        backend is running. Returns the git HEAD so the page can warn
-        about stale backends, plus the CORS origins this backend accepts."""
-        return JSONResponse({
-            "ok": True,
-            "version": head_label,
-            "name": "epubconv",
-            "cors_origins": cors_origins,
-        })
-
-    # Path to the canonical UI HTML — same file Cloudflare Pages serves.
-    # Fall back to the inline INDEX_HTML if pages/app.html is missing
-    # (e.g. running from a wheel where pages/ wasn't packaged).
-    app_html_path = repo_root / "pages" / "app.html"
-
-    @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
-        opts = "\n".join(f"<option>{name}</option>" for name in list_engines())
-        if app_html_path.exists():
-            html = app_html_path.read_text(encoding="utf-8")
-        else:
-            html = INDEX_HTML
-        return html.replace("__ENGINE_OPTIONS__", opts)
-
-    @app.post("/update")
-    def update_endpoint() -> JSONResponse:
-        """Pull latest code, refresh deps, and trigger a reload.
-
-        With ``epubconv serve --reload`` (which ``launch.command`` always
-        uses), uvicorn watches the source tree and restarts on file
-        changes. The browser polls / and refreshes itself when it comes
-        back. We also re-run ``pip install -e ".[web,llm]"`` so a pull
-        that adds an optional dep doesn't leave the server importing a
-        missing package on next request.
-        """
-        if not (repo_root / ".git").exists():
-            raise HTTPException(status_code=400, detail=f"{repo_root} is not a git working tree")
-        rc, out, err = _git("pull", "--ff-only", cwd=repo_root)
-        if rc != 0:
-            raise HTTPException(status_code=500, detail=err or out or "git pull failed")
-        rc2, head, _ = _git("rev-parse", "HEAD", cwd=repo_root)
-        changed = "Already up to date." not in out
-        files = 0
-        if changed:
-            for line in out.splitlines():
-                stripped = line.strip()
-                if "file" in stripped and "changed" in stripped:
-                    parts = stripped.split()
-                    try:
-                        files = int(parts[0])
-                    except (ValueError, IndexError):
-                        pass
-
-        pip_log = ""
-        if changed:
-            pip_log = _refresh_dependencies(repo_root)
-
-        # Touching a watched file forces uvicorn's reloader to restart even
-        # if the pull only changed templates / static assets it doesn't
-        # naturally watch. (When code under src/epubconv/ changed, this is
-        # redundant but harmless.)
-        if changed:
-            (repo_root / "src" / "epubconv" / "__init__.py").touch()
-
-        return JSONResponse({
-            "changed": changed,
-            "head": head if rc2 == 0 else "",
-            "files": files,
-            "stdout": out,
-            "pip": pip_log,
-        })
-
-    @app.post("/test-key")
-    async def test_key_endpoint(
-        provider: str = Form("banana2556"),
-        api_key: str = Form(...),
-    ) -> JSONResponse:
-        """Hit ``GET <base_url>/models`` with the given key as a quick
-        health probe. The Settings tab calls this to give immediate
-        ✓ / ✗ feedback so the user doesn't have to launch a Summary to
-        find out the key is bad."""
-        if provider not in PROVIDERS:
-            raise HTTPException(status_code=400, detail=f"unknown provider: {provider}")
-        if not api_key.strip():
-            raise HTTPException(status_code=400, detail="api_key is required")
-        result = _check_key(provider, api_key.strip())
-        return JSONResponse(result)
-
-    @app.post("/convert")
-    async def convert_endpoint(
-        file: UploadFile = File(...),
-        source_lang: str = Form("zh-CN"),
-        target_lang: str = Form("zh-TW"),
-        writing_mode: str = Form("preserve"),
-        engine_name: str = Form("opencc"),
-        output_format: str = Form("epub"),
-    ) -> FileResponse:
-        if writing_mode not in WRITING_MODES:
-            raise HTTPException(status_code=400, detail=f"writing_mode must be one of {WRITING_MODES}")
-        if output_format not in EBOOK_OUTPUT_FORMATS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"output_format must be one of {EBOOK_OUTPUT_FORMATS}",
-            )
-
-        upload_name = file.filename or "input.epub"
-        tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-web-"))
-        src = tmp_dir / upload_name
-        src.write_bytes(await file.read())
-        try:
-            src_fmt = detect_ebook_format(src)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        dst = tmp_dir / f"{Path(upload_name).stem}.{target_lang}.{output_format}"
-
-        try:
-            engine = get_engine(engine_name, source_lang, target_lang)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        try:
-            convert_ebook(
-                src, dst, engine, target_lang,
-                writing_mode=writing_mode, output_format=output_format,
-            )
-        except CalibreNotFoundError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        media_types = {
-            "epub": "application/epub+zip",
-            "mobi": "application/x-mobipocket-ebook",
-            "azw3": "application/vnd.amazon.ebook",
-        }
-        logger.info(f"convert: {src_fmt} -> {output_format} for {upload_name}")
-        return FileResponse(
-            path=dst,
-            media_type=media_types.get(output_format, "application/octet-stream"),
-            filename=dst.name,
-        )
-
-    @app.post("/export-skill")
-    async def export_skill_endpoint(
-        file: UploadFile = File(...),
-        target_lang: str = Form("zh-TW"),
-        chunk_size: int = Form(1500),
-        name: str = Form(""),
-        description: str = Form(""),
-    ) -> FileResponse:
-        skill_dir, tmp_dir = await _build_skill(file, target_lang, chunk_size, name, description)
-        zip_path = tmp_dir / f"{skill_dir.name}.zip"
-        _zip_dir(skill_dir, zip_path)
-        return FileResponse(
-            path=zip_path,
-            media_type="application/zip",
-            filename=zip_path.name,
-        )
-
-    @app.post("/install-skill")
-    async def install_skill_endpoint(
-        file: UploadFile = File(...),
-        target_lang: str = Form("zh-TW"),
-        chunk_size: int = Form(1500),
-        name: str = Form(""),
-        description: str = Form(""),
-    ) -> JSONResponse:
-        skill_dir, _tmp = await _build_skill(file, target_lang, chunk_size, name, description)
-        target = Path("~/.claude/skills").expanduser() / skill_dir.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(skill_dir, target)
-        chunks = sum(1 for _ in (target / "data.jsonl").open("rb"))
-        return JSONResponse({
-            "path": str(target),
-            "chunks": chunks,
-            "name": skill_dir.name,
-        })
-
-    @app.post("/diff", response_class=HTMLResponse)
-    async def diff_endpoint(
-        file: UploadFile = File(...),
-        source_lang: str = Form("zh-CN"),
-        target_lang: str = Form("zh-TW"),
-        engine_name: str = Form("opencc"),
-    ) -> str:
-        upload_name = file.filename or "input.epub"
-        tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-web-"))
-        src = tmp_dir / upload_name
-        src.write_bytes(await file.read())
-        report = tmp_dir / "report.html"
-
-        try:
-            engine = get_engine(engine_name, source_lang, target_lang)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        build_diff_report(src, engine, report)
-        return report.read_text(encoding="utf-8")
-
-    # --- detached summarisation task ----------------------------------
-    # Only one run at a time. Survives browser disconnects so users can
-    # close the tab / refresh and reconnect without losing progress.
-    summary_run: dict[str, object] = {
-        "active": False,
-        "events": [],            # list of dicts emitted so far (replay buffer)
-        "subscribers": [],       # list of (asyncio.Queue, asyncio.AbstractEventLoop)
-        "started_at": 0.0,
-        "cancel_event": None,    # threading.Event for the current run, or None
-    }
-
-    def _emit_summary_event(event: dict) -> None:
-        """Called from the worker thread; bridges into each subscriber's loop."""
-        summary_run["events"].append(event)
-        for q, loop in list(summary_run["subscribers"]):
-            try:
-                asyncio.run_coroutine_threadsafe(q.put(event), loop)
-            except RuntimeError:
-                pass  # loop closed; subscriber will be cleaned up on its end
-
-    def _summary_worker(src: Path, **kwargs) -> None:
-        try:
-            def progress(stage: str, data) -> None:
-                _emit_summary_event({"stage": stage, **dict(data)})
-            result = summarise_epub(src, progress=progress, **kwargs)
-            _emit_summary_event({
-                "stage": "done",
-                "text": result.text,
-                "chars_used": result.chars_used,
-                "chapters_used": result.chapters_used,
-                "title": result.title,
-                "creator": result.creator,
-            })
-        except SummaryCancelled as exc:
-            logger.info("summarize task: cancelled — {exc}", exc=exc)
-            _emit_summary_event({
-                "stage": "cancelled",
-                "message": str(exc),
-                "note": "Cached batches and sub-summaries preserved. "
-                        "Re-click Generate summary to resume from where you stopped.",
-            })
-        except ValueError as exc:
-            logger.warning("summarize task: 400 {exc}", exc=exc)
-            _emit_summary_event({"stage": "error", "status": 400, "detail": str(exc)})
-        except SummaryError as exc:
-            logger.error("summarize task: 502 {exc}", exc=exc)
-            _emit_summary_event({"stage": "error", "status": 502, "detail": str(exc)})
-        except Exception as exc:
-            logger.exception("summarize task: unexpected error")
-            _emit_summary_event({"stage": "error", "status": 500, "detail": f"{type(exc).__name__}: {exc}"})
-        finally:
-            summary_run["active"] = False
-
-    @app.post("/summarize")
-    async def summarize_endpoint(
-        file: UploadFile = File(...),
-        provider: str = Form("banana2556"),
-        model: str = Form(""),
-        max_chars: int = Form(800_000),
-        per_call_budget: int = Form(20_000),
-        api_key: str = Form(""),
-    ) -> JSONResponse:
-        """Start a detached summarisation task and return immediately.
-
-        The browser then opens GET /summarize-stream to receive progress
-        events. The run survives browser disconnects, so closing the tab,
-        refreshing, or losing network briefly does NOT cancel it — just
-        re-attach to /summarize-stream and the buffered events replay.
-
-        If a run is already in flight, returns 409 with a hint to attach
-        to the existing stream rather than start a new one.
-        """
-        if summary_run["active"]:
-            raise HTTPException(
-                status_code=409,
-                detail="A summarisation is already running — attach to /summarize-stream to follow it.",
-            )
-
-        upload_name = file.filename or "input.epub"
-        tmp_dir = Path(tempfile.mkdtemp(prefix="epubconv-summary-"))
-        src = tmp_dir / upload_name
-        src.write_bytes(await file.read())
-        logger.info(
-            "summarize endpoint: file={name} provider={provider} model={model} max_chars={mc} per_call={pb}",
-            name=upload_name, provider=provider, model=model or "<default>",
-            mc=max_chars, pb=per_call_budget,
-        )
-
-        # Reset replay buffer for this new run.
-        cancel_event = threading.Event()
-        summary_run["active"] = True
-        summary_run["events"] = []
-        summary_run["subscribers"] = []
-        summary_run["started_at"] = __import__("time").time()
-        summary_run["cancel_event"] = cancel_event
-
-        threading.Thread(
-            target=_summary_worker,
-            args=(src,),
-            kwargs=dict(
-                max_chars=max_chars,
-                per_call_budget=per_call_budget,
-                provider=provider,
-                model=model or None,
-                api_key=api_key or None,
-                cancel_event=cancel_event,
-            ),
-            daemon=True,
-        ).start()
-        return JSONResponse({"started": True, "started_at": summary_run["started_at"]})
-
-    @app.post("/summarize-cancel")
-    def summarize_cancel_endpoint() -> JSONResponse:
-        """Politely ask the in-flight summarisation to stop.
-
-        The worker only checks the cancel flag *between* LLM calls, so an
-        already-in-flight chat-completions request will finish (≤ 30-60s
-        typically). Cached results are untouched — re-clicking Generate
-        summary picks up exactly where the cancel landed.
-        """
-        if not summary_run.get("active"):
-            return JSONResponse({"cancel_requested": False, "reason": "no active run"})
-        event = summary_run.get("cancel_event")
-        if event is not None and not event.is_set():
-            event.set()
-            logger.info("summarize: cancel requested")
-        return JSONResponse({"cancel_requested": True})
-
-    @app.get("/summarize-stream")
-    async def summarize_stream() -> StreamingResponse:
-        """Attach to the in-flight summary task (or the just-finished one).
-
-        Replays every event from the start of the current run, then streams
-        new ones as they arrive. Multiple browsers can attach; closing one
-        does not cancel the run.
-        """
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-        subscriber = (queue, loop)
-        summary_run["subscribers"].append(subscriber)
-
-        async def stream():
-            try:
-                # Replay buffered events first.
-                replayed_terminal = False
-                for ev in list(summary_run["events"]):
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    if ev.get("stage") in ("done", "error"):
-                        replayed_terminal = True
-                if replayed_terminal:
-                    return
-
-                # Stream new events.
-                while True:
-                    try:
-                        ev = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    except asyncio.TimeoutError:
-                        # Keepalive comment so reverse proxies / browsers
-                        # don't close the idle connection during slow LLM calls.
-                        yield ": keepalive\n\n"
-                        if not summary_run["active"]:
-                            return
-                        continue
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    if ev.get("stage") in ("done", "error"):
-                        return
-            finally:
-                try:
-                    summary_run["subscribers"].remove(subscriber)
-                except ValueError:
-                    pass
-
-        return StreamingResponse(stream(), media_type="text/event-stream")
-
-    @app.get("/summarize-status")
-    def summarize_status() -> JSONResponse:
-        """Lightweight peek for page-load reconnect logic."""
-        events = summary_run["events"]
-        latest = events[-1] if events else None
-        return JSONResponse({
-            "active": bool(summary_run["active"]),
-            "started_at": summary_run["started_at"],
-            "event_count": len(events),
-            "latest_stage": latest.get("stage") if latest else None,
-            "has_result": any(e.get("stage") == "done" for e in events),
-        })
-
-    return app
-
-
-app = create_app()
