@@ -70,6 +70,39 @@ epubconv batch ./my-books ./out --to zh-TW
 
 State lives in `out/.epubconv-batch.json`. Pass `--no-resume` to force re-conversion.
 
+### Export an EPUB as a Claude Skill
+
+Turn a book into a Claude Skill directory that Claude can search by `grep`:
+
+```bash
+epubconv export-skill book.epub ./skills --to zh-TW
+# writes ./skills/<slug>/{SKILL.md, data.jsonl, index.json, manifest.json}
+cp -r ./skills/<slug> ~/.claude/skills/
+```
+
+The skill bundles:
+
+- **`data.jsonl`** — one section per line, fields: `id`, `chapter_index`,
+  `chapter_num` (normalised integer; `第十二章` → 12), `chapter_title`,
+  `heading_path` (TOC nesting), `section_index`, `text`, `char_count`,
+  `source_sha256`. Text is converted to the target Chinese variant.
+- **`index.json`** — `id` → byte offset and `chapter_title` → `[ids]`,
+  so Claude can jump to a specific record without scanning.
+- **`manifest.json`** — source EPUB hash, book metadata, target language.
+- **`SKILL.md`** — frontmatter (`name`, `description` with trigger
+  phrases) + a how-to-query body that points Claude at `data.jsonl`.
+
+Chapter boundaries come from `nav.xhtml` (EPUB 3) or `toc.ncx` (EPUB 2);
+spine order is the fallback. Cover, colophon, and TOC files are excluded.
+Runs are deterministic — same EPUB and target give identical bytes.
+
+```
+--name <slug>            override the slugified <dc:title>
+--chunk-size <chars>     default 1500
+--description <text>     override the auto-generated description
+--keep-footnotes         inline <aside epub:type="footnote"> instead of dropping
+```
+
 ### Suggest proper-noun candidates
 
 Heuristic name extraction so you don't have to scan a whole book by hand:
@@ -84,11 +117,31 @@ epubconv convert book.epub --glossary names.yaml
 
 ```bash
 pip install -e ".[web]"
-epubconv serve
+epubconv serve            # add --reload to auto-restart on file changes
 # open http://127.0.0.1:8000
 ```
 
-Drag-drop EPUB, pick variant, get back the converted file or a diff report.
+Or on macOS, double-click **`launch.command`** to start the server and
+auto-open the browser without touching the terminal. (First launch creates
+the venv and installs deps; subsequent launches are instant.)
+
+The web UI has five tabs:
+
+* **Convert** — upload EPUB, pick variant, download converted EPUB
+* **Diff** — side-by-side HTML diff
+* **Export Skill** — Download ZIP / **Install to ~/.claude/skills/** (see
+  the export-skill section above)
+* **Summary** — one-click LLM book summary (主角 / 主題 / 章節摘要),
+  uses banana2556 by default. Set the API key in the Settings tab.
+* **⚙ Settings** — store provider API keys
+  (`BANANA2556_API_KEY`, `GEMINI_API_KEY`) without touching the shell.
+  Saved to `~/.config/epubconv/secrets.env` (mode `0600`) and loaded
+  into the server's environment on startup. A value already exported in
+  your shell takes precedence.
+
+A small **↻ Update** button in the header runs `git pull --ff-only` from
+the server. Combined with `--reload`, the server hot-restarts after the
+pull, so updating the app is one click.
 
 ---
 

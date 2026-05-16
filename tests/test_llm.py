@@ -11,7 +11,7 @@ from epubconv.engines.llm_fallback_engine import (
     LLMFallbackEngine,
 )
 from epubconv.llm.cache import Cache
-from epubconv.llm.client import LLMConfig, PROVIDERS
+from epubconv.llm.client import LLMClient, LLMConfig, PROVIDERS, _is_retryable
 
 
 # ---------- LLMConfig ----------
@@ -144,3 +144,103 @@ def test_ambiguous_routes_to_llm_and_caches(tmp_path: Path) -> None:
 def test_default_ambiguous_set_includes_known_pitfalls() -> None:
     for ch in "后发只表干里":
         assert ch in DEFAULT_AMBIGUOUS_HANS
+
+
+# ---------- _is_retryable ----------
+
+
+class _FakeStatusError(Exception):
+    def __init__(self, status_code: int, message: str = "") -> None:
+        super().__init__(message or f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+def test_is_retryable_408() -> None:
+    assert _is_retryable(_FakeStatusError(408))
+
+
+def test_is_retryable_429_5xx() -> None:
+    for code in (429, 500, 502, 503, 504):
+        assert _is_retryable(_FakeStatusError(code)), code
+
+
+def test_is_retryable_4xx_other_not_retryable() -> None:
+    assert not _is_retryable(_FakeStatusError(400))
+    assert not _is_retryable(_FakeStatusError(401))
+    assert not _is_retryable(_FakeStatusError(404))
+
+
+def test_is_retryable_stream_disconnected_message() -> None:
+    """Banana2556's 408 message is what we actually saw in the wild."""
+    exc = Exception("stream error: stream disconnected before completion")
+    assert _is_retryable(exc)
+
+
+def test_is_retryable_timeout_message() -> None:
+    assert _is_retryable(Exception("Request timeout"))
+
+
+# ---------- LLMClient.complete retry behaviour ----------
+
+
+def _fake_choice(content: str):
+    return SimpleNamespace(message=SimpleNamespace(content=content))
+
+
+def test_complete_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = LLMConfig(base_url="http://x", api_key="k", model="m")
+    # Build the client without actually instantiating openai.OpenAI.
+    client = LLMClient.__new__(LLMClient)
+    client.cfg = cfg
+
+    calls = {"n": 0}
+
+    def fake_create(**kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _FakeStatusError(408, "stream disconnected")
+        return SimpleNamespace(choices=[_fake_choice("OK")])
+
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    monkeypatch.setattr("epubconv.llm.client.time.sleep", lambda s: None)
+
+    out = client.complete("sys", "user")
+    assert out == "OK"
+    assert calls["n"] == 3
+
+
+def test_complete_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = LLMConfig(base_url="http://x", api_key="k", model="m")
+    client = LLMClient.__new__(LLMClient)
+    client.cfg = cfg
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kw: (_ for _ in ()).throw(_FakeStatusError(503))
+        ))
+    )
+    monkeypatch.setattr("epubconv.llm.client.time.sleep", lambda s: None)
+
+    with pytest.raises(_FakeStatusError):
+        client.complete("sys", "user")
+
+
+def test_complete_does_not_retry_4xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = LLMConfig(base_url="http://x", api_key="k", model="m")
+    client = LLMClient.__new__(LLMClient)
+    client.cfg = cfg
+    calls = {"n": 0}
+
+    def fake_create(**kw):
+        calls["n"] += 1
+        raise _FakeStatusError(401, "unauthorised")
+
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    monkeypatch.setattr("epubconv.llm.client.time.sleep", lambda s: None)
+
+    with pytest.raises(_FakeStatusError):
+        client.complete("sys", "user")
+    assert calls["n"] == 1

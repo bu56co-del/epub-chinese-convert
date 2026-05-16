@@ -18,10 +18,9 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from bs4 import BeautifulSoup
-
 from .epub import extract_epub
 from .pipeline import _read_text
+from .skill.extract import clean_text
 
 # Common single-char Chinese tokens that aren't names. Rough; user reviews output.
 _STOP_CHARS = set(
@@ -37,13 +36,6 @@ _HONORIFICS = ("老", "小", "阿", "大")
 _CJK_RE = re.compile(r"[一-鿿]+")
 
 
-def _xhtml_text(path: Path) -> str:
-    soup = BeautifulSoup(_read_text(path), "lxml-xml")
-    for tag in soup.find_all(["script", "style", "code", "pre"]):
-        tag.decompose()
-    return soup.get_text(" ")
-
-
 def extract_candidates(epub: Path, *, min_occurrences: int = 3, max_len: int = 4) -> list[tuple[str, int]]:
     """Return ``(token, count)`` pairs sorted by count desc, then token asc."""
     import tempfile
@@ -57,7 +49,7 @@ def extract_candidates(epub: Path, *, min_occurrences: int = 3, max_len: int = 4
         for path in pkg.content_files:
             if path.suffix.lower() not in {".xhtml", ".html", ".htm"}:
                 continue
-            text = _xhtml_text(path)
+            text = clean_text(_read_text(path))
 
             for opener, closer in _QUOTE_PAIRS:
                 pattern = re.compile(f"{re.escape(opener)}([^{re.escape(opener)}{re.escape(closer)}]{{1,{max_len}}}){re.escape(closer)}")

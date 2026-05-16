@@ -11,6 +11,8 @@ NCX_EXTS = {".ncx"}
 OPF_EXTS = {".opf"}
 
 CONTAINER_NS = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+OPF_NS = "http://www.idpf.org/2007/opf"
+DC_NS = "http://purl.org/dc/elements/1.1/"
 
 
 @dataclass
@@ -40,6 +42,58 @@ class EpubPackage:
     @property
     def css_files(self) -> list[Path]:
         return sorted(p for p in self.root.rglob("*.css") if p.is_file())
+
+    @property
+    def spine_files(self) -> list[Path]:
+        """Content files in OPF spine order, resolved to absolute paths.
+
+        Falls back to ``content_files`` (sorted-by-path) if no spine is found.
+        """
+        opf = self.opf_path
+        tree = etree.parse(str(opf))
+        root = tree.getroot()
+
+        manifest_items: dict[str, str] = {}
+        for item in root.iter(f"{{{OPF_NS}}}item"):
+            item_id = item.get("id")
+            href = item.get("href")
+            if item_id and href:
+                manifest_items[item_id] = href
+
+        ordered: list[Path] = []
+        for itemref in root.iter(f"{{{OPF_NS}}}itemref"):
+            idref = itemref.get("idref")
+            href = manifest_items.get(idref)
+            if not href:
+                continue
+            ordered.append((opf.parent / href).resolve())
+
+        return ordered or self.content_files
+
+    def metadata(self) -> dict[str, str | list[str]]:
+        """Return book metadata from OPF ``<dc:*>`` elements.
+
+        Multi-valued elements (e.g. multiple ``<dc:creator>``) come back as
+        lists; single-valued ones as strings. Missing keys are omitted.
+        """
+        tree = etree.parse(str(self.opf_path))
+        root = tree.getroot()
+        out: dict[str, str | list[str]] = {}
+        for el in root.iter():
+            if not isinstance(el.tag, str) or not el.tag.startswith(f"{{{DC_NS}}}"):
+                continue
+            key = el.tag[len(DC_NS) + 2 :]  # strip "{ns}"
+            value = (el.text or "").strip()
+            if not value:
+                continue
+            existing = out.get(key)
+            if existing is None:
+                out[key] = value
+            elif isinstance(existing, list):
+                existing.append(value)
+            else:
+                out[key] = [existing, value]
+        return out
 
 
 def extract_epub(epub_path: Path, dest: Path) -> EpubPackage:

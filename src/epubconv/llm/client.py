@@ -15,9 +15,18 @@ clear hint.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 
 PROVIDERS = ("gemini", "banana2556")
+
+# Long-context summary requests can take well over a minute on busy upstreams.
+# Default OpenAI SDK timeout (10 min) is fine, but we set explicitly so it's
+# obvious. Banana2556 sometimes drops the upstream connection mid-stream
+# (HTTP 408 "stream disconnected"); we retry those with back-off.
+DEFAULT_TIMEOUT = 600.0
+RETRY_STATUS = (408, 429, 500, 502, 503, 504)
+MAX_ATTEMPTS = 3
 
 _DEFAULTS: dict[str, tuple[str, str, str]] = {
     # provider -> (base_url, env_var, default_model)
@@ -32,6 +41,13 @@ _DEFAULTS: dict[str, tuple[str, str, str]] = {
         "gpt-4o-mini",
     ),
 }
+
+
+def provider_base_url(name: str) -> str:
+    """Return the OpenAI-compatible base URL for a known provider."""
+    if name not in _DEFAULTS:
+        raise ValueError(f"unknown LLM provider: {name!r}; expected one of {PROVIDERS}")
+    return _DEFAULTS[name][0]
 
 
 @dataclass(frozen=True)
@@ -65,7 +81,7 @@ SYSTEM_PROMPT = (
 class LLMClient:
     """Thin wrapper around the OpenAI SDK pinned to chat completions."""
 
-    def __init__(self, cfg: LLMConfig) -> None:
+    def __init__(self, cfg: LLMConfig, *, timeout: float = DEFAULT_TIMEOUT) -> None:
         try:
             from openai import OpenAI  # noqa: F401
         except ImportError as exc:
@@ -76,16 +92,56 @@ class LLMClient:
         from openai import OpenAI
 
         self.cfg = cfg
-        self._client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+        self._client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url, timeout=timeout)
 
     def translate(self, text: str, target_lang: str) -> str:
-        resp = self._client.chat.completions.create(
-            model=self.cfg.model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Target: {target_lang}\n\n{text}"},
-            ],
+        return self.complete(
+            system=SYSTEM_PROMPT,
+            user=f"Target: {target_lang}\n\n{text}",
         )
-        choice = resp.choices[0]
-        return (choice.message.content or "").strip()
+
+    def complete(self, system: str, user: str, *, temperature: float = 0.0) -> str:
+        """Generic chat completion with retry on transient errors.
+
+        Banana2556 occasionally returns 408 ("stream disconnected before
+        completion") for long requests where the upstream provider drops
+        mid-stream. We retry such errors plus 429 / 5xx with exponential
+        back-off (5, 10, 20s) up to ``MAX_ATTEMPTS`` total attempts.
+        """
+        last_err: Exception | None = None
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.cfg.model,
+                    temperature=temperature,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                choice = resp.choices[0]
+                return (choice.message.content or "").strip()
+            except Exception as exc:
+                if not _is_retryable(exc) or attempt == MAX_ATTEMPTS - 1:
+                    raise
+                last_err = exc
+                wait = (2 ** attempt) * 5  # 5, 10, 20s
+                time.sleep(wait)
+        # Defensive — the loop should always raise or return.
+        raise RuntimeError(f"unexpected: {last_err}")
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Treat 408 / 429 / 5xx and connection drops as retryable."""
+    status = getattr(exc, "status_code", None)
+    if status in RETRY_STATUS:
+        return True
+    # APIStatusError on newer openai SDKs exposes .status_code; older builds
+    # carry it inside the response. Inspect the message as a final fallback
+    # for the banana2556-specific "stream disconnected before completion".
+    message = str(exc).lower()
+    if "stream disconnected" in message or "stream closed" in message:
+        return True
+    if "timeout" in message or "connection" in message and "reset" in message:
+        return True
+    return False
