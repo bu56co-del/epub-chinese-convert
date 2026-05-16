@@ -1,0 +1,11 @@
+# Cloudflare Pages headers file.
+# Serve the install / uninstall scripts as plain text so `curl ... | bash`
+# works regardless of CDN content-sniffing.
+
+/install.sh
+  Content-Type: text/x-shellscript; charset=utf-8
+  Cache-Control: public, max-age=60
+
+/uninstall.sh
+  Content-Type: text/x-shellscript; charset=utf-8
+  Cache-Control: public, max-age=60
