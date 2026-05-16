@@ -375,6 +375,47 @@ def test_healthz_returns_version_and_cors_origins(client: TestClient) -> None:
     # The Cloudflare Pages origin is in the allow-list out of the box so the
     # hosted UI can talk to a local backend.
     assert "https://epub-chinese-convert.pages.dev" in payload["cors_origins"]
+    # The UI uses launch_path to show the user *their* launcher, not a guess.
+    assert payload["launch_path"].endswith("launch.command") or \
+           payload["launch_path"].endswith("launch.bat")
+    assert payload["platform"]  # darwin / linux / win32
+
+
+def test_csrf_blocks_cross_origin_post(client: TestClient) -> None:
+    """A POST with Origin pointing at evil.com must be rejected before the
+    handler runs, even though CORS would still let it through."""
+    r = client.post("/update", headers={"Origin": "https://evil.com"})
+    assert r.status_code == 403
+    assert "not allowed" in r.json()["detail"]
+
+
+def test_csrf_allows_cf_pages_origin(client: TestClient) -> None:
+    r = client.post(
+        "/update",
+        headers={"Origin": "https://epub-chinese-convert.pages.dev"},
+    )
+    # 200 or 500 (no real git) is fine — what matters is we passed CSRF.
+    assert r.status_code != 403
+
+
+def test_csrf_allows_pages_dev_preview_origin(client: TestClient) -> None:
+    r = client.post(
+        "/update",
+        headers={"Origin": "https://feature-abc.epub-chinese-convert.pages.dev"},
+    )
+    assert r.status_code != 403
+
+
+def test_csrf_allows_missing_origin(client: TestClient) -> None:
+    """curl / scripts / same-origin requests omit Origin; we shouldn't break
+    those."""
+    r = client.post("/update")
+    assert r.status_code != 403
+
+
+def test_csrf_allows_localhost_origin(client: TestClient) -> None:
+    r = client.post("/update", headers={"Origin": "http://localhost:8000"})
+    assert r.status_code != 403
 
 
 def test_cors_preflight_for_cf_pages_origin(client: TestClient) -> None:

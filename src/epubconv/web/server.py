@@ -879,6 +879,36 @@ def create_app() -> FastAPI:
         expose_headers=["Content-Disposition"],
     )
 
+    # CSRF defense: every state-changing request that comes from a *browser*
+    # carries an Origin header. We reject the request unless that origin is
+    # in our allow-list. Curl / scripts / same-origin requests omit the
+    # header and are allowed (legitimate use). This blocks malicious sites
+    # that try to POST to your localhost from your authenticated browser.
+    import re as _re
+    _cors_pages_re = _re.compile(r"^https://[^/]+\.pages\.dev$")
+
+    @app.middleware("http")
+    async def csrf_origin_check(request, call_next):
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            origin = request.headers.get("origin", "").rstrip("/")
+            if origin:
+                allowed = (
+                    origin in cors_origins
+                    or _cors_pages_re.match(origin)
+                    or origin.startswith("http://127.0.0.1")
+                    or origin.startswith("http://localhost")
+                )
+                if not allowed:
+                    logger.warning(
+                        "csrf: blocked {method} {path} from origin={origin}",
+                        method=request.method, path=request.url.path, origin=origin,
+                    )
+                    return JSONResponse(
+                        {"detail": f"origin {origin!r} not allowed for state-changing requests"},
+                        status_code=403,
+                    )
+        return await call_next(request)
+
     # On every server start, log the git HEAD so the user can confirm
     # they're actually running the version they just pulled — diagnoses
     # "I updated but it's still broken" reports in seconds.
@@ -889,16 +919,35 @@ def create_app() -> FastAPI:
         head_label = "no-git"
     logger.info(f"epubconv server starting on git HEAD = {head_label}")
 
+    # Tell the UI where launch.command lives so it can show a useful
+    # "double-click this to restart" hint if the backend stops. macOS
+    # gets launch.command; Windows gets launch.bat. The path is the one
+    # in *this* installation, not a guess, so each user gets their own.
+    _launch_filename = "launch.bat" if sys.platform.startswith("win") else "launch.command"
+    _launch_path = str((repo_root / _launch_filename).resolve())
+
     @app.get("/healthz")
     def healthz() -> JSONResponse:
         """Cheap probe so the Cloudflare UI can detect whether a local
-        backend is running. Returns the git HEAD so the page can warn
-        about stale backends, plus the CORS origins this backend accepts."""
+        backend is running. Returns:
+
+        * ``version``: git HEAD short SHA, so the UI can warn about stale
+          backends.
+        * ``cors_origins``: which web origins this backend will accept.
+        * ``launch_path``: absolute path to this install's launcher
+          (``launch.command`` on macOS, ``launch.bat`` on Windows). The UI
+          remembers this in localStorage so the "backend is down" overlay
+          can tell the user *exactly* which file to double-click.
+        * ``platform``: ``"darwin"`` / ``"win32"`` / etc., so the UI can
+          render the right "open" command (``open`` vs ``start``).
+        """
         return JSONResponse({
             "ok": True,
             "version": head_label,
             "name": "epubconv",
             "cors_origins": cors_origins,
+            "launch_path": _launch_path,
+            "platform": sys.platform,
         })
 
     # Path to the canonical UI HTML — same file Cloudflare Pages serves.
