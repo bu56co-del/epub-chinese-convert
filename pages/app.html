@@ -196,14 +196,19 @@
     </div>
 
     <div id="launch-cmd-block" style="margin-top:1em;display:none">
-      <p style="margin-bottom:0.4em">Open Terminal and run:</p>
-      <div>
-        <span class="install-cmd" id="launch-cmd"></span>
-        <button type="button" class="copy" id="launch-copy">Copy</button>
+      <div style="background:var(--bg-raised);border:1px solid var(--accent);border-radius:8px;padding:1em">
+        <p style="margin:0 0 0.4em;font-weight:600;color:var(--text-strong);font-size:1em">
+          Next step → Open Terminal and run this
+          <span class="muted" style="font-weight:400;font-size:0.85em">(saving only stores the path; the browser can't launch your file)</span>
+        </p>
+        <div>
+          <span class="install-cmd" id="launch-cmd"></span>
+          <button type="button" class="copy" id="launch-copy">Copy</button>
+        </div>
+        <p class="muted" style="margin:0.6em 0 0">
+          Or just double-click <code id="launch-cmd-filename"></code> in Finder.
+        </p>
       </div>
-      <p class="muted" style="margin-top:0.6em">
-        Or just double-click <code id="launch-cmd-filename"></code> in Finder.
-      </p>
     </div>
     <p style="margin-top:1.5em" class="muted">
       Haven't actually installed yet? &nbsp;
@@ -964,7 +969,7 @@
     input.setSelectionRange(0, input.value.length - f.name.length);
   });
 
-  document.getElementById("save-launch-path").addEventListener("click", () => {
+  document.getElementById("save-launch-path").addEventListener("click", async () => {
     const input = document.getElementById("launch-path-input");
     const value = input.value.trim();
     if (value) {
@@ -978,6 +983,31 @@
       localStorage.removeItem(LAUNCH_PLATFORM_KEY);
     }
     renderLaunchCmd();
+
+    // Auto-copy the launch command so the user only has to switch to
+    // Terminal + paste. Also flash + scroll the next-step block so it's
+    // obvious that Save *prepared* the command but didn't run it.
+    if (value) {
+      try {
+        const cmd = document.getElementById("launch-cmd").textContent.trim();
+        if (cmd) await navigator.clipboard.writeText(cmd);
+      } catch (e) { /* user blocked clipboard — they can still hit Copy */ }
+      const block = document.getElementById("launch-cmd-block");
+      block.scrollIntoView({ behavior: "smooth", block: "center" });
+      block.animate(
+        [
+          { boxShadow: "0 0 0 0 rgba(96,165,250,0)" },
+          { boxShadow: "0 0 0 8px rgba(96,165,250,0.4)" },
+          { boxShadow: "0 0 0 0 rgba(96,165,250,0)" },
+        ],
+        { duration: 900, iterations: 2 },
+      );
+      const copyBtn = document.getElementById("launch-copy");
+      const orig = copyBtn.textContent;
+      copyBtn.textContent = "Copied — paste in Terminal!";
+      copyBtn.classList.add("copied");
+      setTimeout(() => { copyBtn.textContent = orig; copyBtn.classList.remove("copied"); }, 2500);
+    }
   });
 
   document.getElementById("launch-path-input").addEventListener("keydown", (e) => {
