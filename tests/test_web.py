@@ -67,7 +67,7 @@ def skill_epub(tmp_path: Path) -> Path:
 def test_index_serves_html_with_engine_options(client: TestClient) -> None:
     r = client.get("/")
     assert r.status_code == 200
-    assert "<title>epubconv</title>" in r.text
+    assert "<title>epubconv (web)</title>" in r.text  # served from pages/app.html
     assert "<option>opencc</option>" in r.text  # builtin registered via entry-point
 
 
@@ -363,6 +363,41 @@ def _wait_for_done(client: TestClient, timeout: float = 5.0) -> list[dict]:
         _t.sleep(0.05)
     r = client.get("/summarize-stream")
     return _parse_sse_events(r.text)
+
+
+def test_healthz_returns_version_and_cors_origins(client: TestClient) -> None:
+    r = client.get("/healthz")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["name"] == "epubconv"
+    assert "version" in payload
+    # The Cloudflare Pages origin is in the allow-list out of the box so the
+    # hosted UI can talk to a local backend.
+    assert "https://epub-chinese-convert.pages.dev" in payload["cors_origins"]
+
+
+def test_cors_preflight_for_cf_pages_origin(client: TestClient) -> None:
+    """A browser on the CF page must be allowed to talk to localhost."""
+    r = client.options(
+        "/healthz",
+        headers={
+            "Origin": "https://epub-chinese-convert.pages.dev",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == "https://epub-chinese-convert.pages.dev"
+
+
+def test_index_serves_app_html_with_backend_constant(client: TestClient) -> None:
+    """The page served at / must include the BACKEND-detection JS so it
+    behaves the same whether loaded from localhost or from CF Pages."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "const BACKEND" in r.text
+    assert "install-overlay" in r.text  # offline-friendly install panel
+    assert "<option>opencc</option>" in r.text  # engine options still injected
 
 
 def test_index_has_pdf_download_and_print_container(client: TestClient) -> None:

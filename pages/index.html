@@ -16,6 +16,16 @@
   <p class="tagline">本機行嘅中文電子書工具：格式互轉、Skill 匯出、AI 書籍撮要</p>
 </header>
 
+<div id="backend-up" style="display:none;background:var(--bg-raised);border:1px solid var(--border);border-left:4px solid var(--ok);border-radius:8px;padding:1em 1.2em;margin-bottom:1.5em">
+  <strong style="color:var(--text-strong)">✅ 本機 server 已開</strong>
+  <span class="muted" id="backend-up-version"></span>
+  <div style="margin-top:0.75em">
+    <a href="./app.html" style="display:inline-block;background:var(--accent);color:#0f172a;font-weight:600;padding:0.6em 1.2em;border-radius:6px;text-decoration:none">
+      開個 App →
+    </a>
+  </div>
+</div>
+
 <section class="cta">
   <h2 style="margin-top:0;border:0;padding:0;font-size:1.2em">📦 一行裝起</h2>
 
@@ -134,6 +144,22 @@
     else if (/Windows/i.test(navigator.userAgent)) defaultOS = "windows";
   } catch (e) { /* private mode */ }
   showOS(defaultOS);
+
+  // -------- Backend probe — show "Open App" if local server is up --------
+  (async () => {
+    try {
+      const r = await fetch("http://127.0.0.1:8000/healthz", {
+        cache: "no-store",
+        signal: AbortSignal.timeout(2500),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        document.getElementById("backend-up").style.display = "block";
+        document.getElementById("backend-up-version").textContent =
+          data.version ? ` (${data.version})` : "";
+      }
+    } catch (e) { /* backend not running — keep install instructions */ }
+  })();
 
   // -------- Copy buttons --------
   document.querySelectorAll("button.copy").forEach(btn => {
